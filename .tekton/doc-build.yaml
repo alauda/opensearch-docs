@@ -1,0 +1,176 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: doc-build-opensearch
+  annotations:
+    pipelinesascode.tekton.dev/on-comment: "^(/doc-build)$"
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+    pipelinesascode.tekton.dev/on-cel-expression: |-
+      (
+        event == "push" &&
+        !last_commit_title.contains("ci skip") && (
+          source_branch.matches("^(main|master|release-v?[0-9]+([.][0-9]+)+)$") ||
+          target_branch.matches("^(main|master|release-v?[0-9]+([.][0-9]+)+)$")
+        )
+      )
+spec:
+  # `tasks` is the budget for all tasks together, not per task — a run whose
+  # steps add up past it is cancelled wherever it happens to be, and everything
+  # already done is thrown away because `upload-translations` runs last.
+  #
+  # Sized from immutable-infra-docs on 2026-09-03/04, where 6h cancelled two
+  # runs during `auto-translate-ru` after Chinese had already succeeded:
+  #   auto-translate-zh   2h06m–2h25m for one attempt, 3h25m–3h34m with retries
+  #   auto-translate-ru   still running at 2h25m and 2h30m when the budget ran out
+  # so the realistic total is over 8h once either language needs a retry.
+  #
+  # This is the coarse bound. What stops a genuinely stuck step is the per-task
+  # `timeout` in the pipeline body (ops/edge-devops-task), and with retries: 2
+  # on each translate task no aggregate can cover the true worst case.
+  timeouts:
+    pipeline: 12h
+    tasks: 10h
+
+  params:
+    - name: doc-base
+      value: opensearch
+
+    # 下面这些变量都是 pac 触发时自动注入的
+    - name: git-url
+      value: "{{ repo_url }}"
+    - name: git-revision
+      value: "{{ source_branch }}"
+    - name: git-commit
+      value: "{{ revision }}"
+    - name: pull-request-number
+      value: "{{ pull_request_number }}"
+    - name: pull-request-target
+      value: "{{ target_branch }}"
+
+
+  pipelineRef:
+    resolver: hub
+    params:
+    - name: catalog
+      value: alauda
+    - name: kind
+      value: pipeline
+    - name: name
+      value: product-docs-pipeline
+    - name: version
+      value: "0.1"
+
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          storageClassName: topolvm
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2.5Gi
+    - name: cache
+      persistentVolumeClaim:
+        claimName: doc-build-cache
+      subPath: yarn_cache
+
+    # This secret will be replaced by the pac controller
+    - name: basic-auth
+      secret:
+        secretName: "{{ git_auth_secret }}"
+
+
+  taskRunTemplate:
+    # Default: run tasks as root (UID 0) since most build tasks require root privileges.
+    # Individual tasks can override this as needed (see taskRunSpecs below).
+    podTemplate:
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+        fsGroupChangePolicy: "OnRootMismatch"
+
+  taskRunSpecs:
+    - pipelineTaskName: git-clone
+      # Override: run git-clone as non-root user for security.
+      podTemplate:
+        securityContext:
+          runAsUser: 65532
+          runAsGroup: 65532
+          fsGroup: 65532
+          fsGroupChangePolicy: "OnRootMismatch"
+
+    - pipelineTaskName: build-online-docs-io
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-online-docs-cn
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-offline-docs
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-exports-docs
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: export-docs
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-online-docs-russian
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-offline-docs-russian
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: build-exports-docs-russian
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
+    - pipelineTaskName: export-docs-russian
+      computeResources:
+        requests:
+          cpu: 2
+          memory: 4Gi
+        limits:
+          cpu: 4
+          memory: 8Gi
