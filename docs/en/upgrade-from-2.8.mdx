@@ -1,0 +1,186 @@
+---
+title: Upgrade from 2.8.0
+weight: 50
+---
+
+# Upgrade from operator 2.8.0
+
+This page describes the in-place upgrade from operator 2.8.0 to Alauda Data Services Search Engine E1 3.0.
+
+## What changes
+
+Operator 2.8.0 managed resources in the `opensearch.opster.io/v1` API group. E1 3.0 manages resources in the `opensearch.org/v1` API group. The kinds and their fields are the same in both groups.
+
+| | 2.8.0 | E1 3.0 |
+|---|---|---|
+| API group | `opensearch.opster.io/v1` | `opensearch.org/v1` |
+| Pod labels | `opster.io/opensearch-cluster`, `opster.io/opensearch-nodepool` | `opensearch.org/opensearch-cluster`, `opensearch.org/opensearch-nodepool` |
+
+The E1 3.0 bundle installs the CRDs of both groups. After the upgrade:
+
+1. **Automatic migration.** For every resource in `opensearch.opster.io/v1`, the operator creates a resource with the same name and namespace in `opensearch.org/v1`, with the same spec, labels and annotations, and copies the status.
+2. **The old group becomes read-only.** A validating webhook rejects the creation of new `opensearch.opster.io/v1` resources and any change to the `spec` of existing ones. Status updates and deletion are still allowed.
+3. **One rolling restart per node pool.** Each node pool of each existing cluster is restarted once, one pod at a time.
+
+From then on, the `opensearch.org/v1` resource is the one you edit. The operator copies its status back to the old resource, but never copies spec changes in either direction after the migration.
+
+## How the migration works
+
+The migration covers these kinds: `OpenSearchCluster`, `OpensearchUser`, `OpensearchRole`, `OpensearchUserRoleBinding`, `OpensearchTenant`, `OpensearchActionGroup`, `OpenSearchISMPolicy`, `OpensearchSnapshotPolicy`, `OpensearchIndexTemplate` and `OpensearchComponentTemplate`.
+
+A resource is migrated only when it is in a ready state:
+
+| Kind | Migrated when |
+|------|---------------|
+| `OpenSearchCluster` | `status.phase` is `RUNNING` |
+| All other kinds | `status.state` is `CREATED` |
+
+A resource that is not ready is skipped and checked again every 30 seconds. It is migrated as soon as it becomes ready.
+
+Each migrated resource carries annotations that record its origin:
+
+```yaml
+metadata:
+  annotations:
+    opensearch.org/migrated-from: opensearch.opster.io/v1
+    opensearch.org/migration-timestamp: "<time of migration>"
+    opensearch.org/source-uid: "<uid of the old resource>"
+```
+
+For clusters, the operator also makes the new resource the owner of the TLS certificate Secrets (`<cluster>-ca`, `<cluster>-transport-cert`, `<cluster>-http-cert`, `<cluster>-admin-cert`), so the certificates are kept even if the old resource is deleted later.
+
+### Why every node pool restarts once
+
+A StatefulSet's pod selector cannot be changed, and E1 3.0 selects pods by the new `opensearch.org/...` labels. For each node pool, the operator therefore:
+
+1. relabels the running pods with the new labels;
+2. deletes the StatefulSet without deleting its pods;
+3. recreates the StatefulSet with the 3.0 specification, which adopts the running pods;
+4. restarts the adopted pods one at a time, because the 3.0 pod template differs from the 2.8.0 one.
+
+The restart uses the regular rolling-restart procedure: one pod at a time, waiting for the cluster to recover before moving on. Data on persistent volumes is kept.
+
+For every recreated StatefulSet the operator records a `Warning` event with the reason `StatefulSetRecreated` on the cluster, followed by `RollingRestart` events. If an OpenSearch version upgrade is in progress at the same time, the version upgrade restarts the pods instead.
+
+## Before the upgrade
+
+Check each item on every Kubernetes cluster you are going to upgrade.
+
+1. **Set `vm.max_map_count` on the nodes.** E1 does not run the privileged init container that set `vm.max_map_count` in 2.8.0, whatever the value of `spec.general.setVMMaxMapCount`. Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher **before** the upgrade; otherwise the pods fail to start after their restart. See [Set vm.max_map_count on nodes](./install.mdx#set-vmmax_map_count-on-nodes).
+
+2. **All clusters are healthy and `RUNNING`.** Clusters that are not `RUNNING` are not migrated until they are.
+
+   ```bash
+   kubectl get opensearchclusters.opensearch.opster.io -A \
+     -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,VERSION:.spec.general.version
+   ```
+
+   Also check that the OpenSearch cluster health is `green`.
+
+3. **Other resources are `CREATED`.** For example:
+
+   ```bash
+   kubectl get opensearchusers.opensearch.opster.io -A \
+     -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATE:.status.state
+   ```
+
+   Repeat for the other kinds listed above that you use.
+
+4. **Every index has at least one replica.** During the rolling restart, an index without replicas is unavailable while the node that holds it restarts. The cluster health is expected to be `yellow` while each node restarts.
+
+5. **Take a snapshot.** There is no automated rollback (see [Rollback](#rollback)). Take a snapshot of your data before you upgrade.
+
+6. **Check the engine version.** The migration keeps `spec.general.version` unchanged; the operator upgrade does not upgrade OpenSearch. Because every pod is restarted, the image of the version each cluster runs must still be available to the nodes.
+
+7. **Check clusters without TLS.** In E1 3.0, a cluster whose spec has no TLS configuration (no `spec.security.tls.transport` or `spec.security.tls.http`) runs with the OpenSearch security plugin disabled and serves plain HTTP without authentication. If such a cluster relied on the security plugin, resolve this before you upgrade.
+
+8. **Check your Pod Security settings.** After the restart, the OpenSearch and Dashboards pods run with the restricted defaults described in [Install the operator](./install.mdx#pod-security), including `fsGroup: 1000` for OpenSearch pods. If you set your own `podSecurityContext` or `securityContext`, your values still take precedence.
+
+9. **Plan a maintenance window.** The rolling restart can take a long time for node pools with many nodes or much data.
+
+10. **Update your automation.** Scripts, GitOps repositories and Helm charts that create or modify `opensearch.opster.io/v1` resources fail after the upgrade. Switch them to `opensearch.org/v1`, and switch label selectors from `opster.io/...` to `opensearch.org/...`.
+
+## Upgrade the operator
+
+E1 3.0 is published in the same OLM package (`opensearch-operator`) on both the `stable` and `alpha` channels, and it is marked as able to replace any 2.8.x version. An existing 2.8.0 subscription on either channel is offered the upgrade.
+
+- With automatic approval, OLM upgrades the operator as soon as the new version is available in the catalog.
+- With manual approval, approve the pending InstallPlan in the web console, or with kubectl:
+
+  ```bash
+  kubectl -n <operator-namespace> get installplan
+  kubectl -n <operator-namespace> patch installplan <installplan-name> \
+    --type merge -p '{"spec":{"approved":true}}'
+  ```
+
+If no upgrade is offered, check that the subscription's catalog source provides the E1 3.0 bundle. OLM only offers upgrades from the catalog source and channel that the subscription refers to.
+
+If your 2.8.0 subscription points to a different catalog source than the one that publishes E1, OLM never offers the upgrade, because it does not move a subscription between catalog sources. Edit the subscription so that `spec.source` and `spec.sourceNamespace` name the catalog source that publishes E1, and keep `spec.channel` (`alpha`, or `stable`):
+
+```bash
+kubectl -n <operator-namespace> patch subscription <subscription-name> --type merge \
+  -p '{"spec":{"source":"<catalog-source>","sourceNamespace":"<catalog-namespace>"}}'
+```
+
+Wait until the new ClusterServiceVersion is `Succeeded`:
+
+```bash
+kubectl -n <operator-namespace> get csv
+```
+
+## After the upgrade
+
+1. **New resources exist.** Every old resource has a counterpart in the new group:
+
+   ```bash
+   kubectl get opensearchclusters.opensearch.opster.io -A
+   kubectl get opensearchclusters.opensearch.org -A
+   ```
+
+   Repeat for the other kinds you use, for example `opensearchusers.opensearch.org`.
+
+2. **Watch the rolling restart.**
+
+   ```bash
+   kubectl -n <namespace> get events --field-selector involvedObject.name=<cluster-name>
+   kubectl -n <namespace> get pods -l opensearch.org/opensearch-cluster=<cluster-name> -w
+   ```
+
+   Expect one `StatefulSetRecreated` event per node pool, then `RollingRestart` events.
+
+3. **The cluster is `RUNNING` and healthy** once all pods have restarted:
+
+   ```bash
+   kubectl -n <namespace> get opensearchclusters.opensearch.org <cluster-name> \
+     -o jsonpath='{.status.phase}{"\n"}'
+   ```
+
+   Check that the OpenSearch cluster health is back to `green`.
+
+4. **Make changes on the new group only.** Use `kubectl edit opensearchclusters.opensearch.org <cluster-name>` (and the `opensearch.org` group for every other kind). An attempt to change the spec of an old resource is rejected with a message that the `opensearch.opster.io/v1` API group is deprecated.
+
+### Old resources after the migration
+
+You do not need to delete the old `opensearch.opster.io/v1` resources. If you delete them:
+
+- Deleting an old resource is held back until its `opensearch.org/v1` counterpart exists, so it cannot be removed before it has been migrated.
+- Deleting an `opensearch.org/v1` resource that was migrated also deletes the corresponding old resource.
+
+## Rollback \{#rollback\}
+
+There is no automated rollback to operator 2.8.0:
+
+- OLM does not downgrade an installed operator.
+- After the migration, the old resources keep the spec they had at the time of the migration. Changes you make to `opensearch.org/v1` resources are not copied back.
+- The node pool StatefulSets have been recreated with the `opensearch.org/...` selector labels.
+
+If the upgrade fails, collect the operator logs and the cluster events, keep the data volumes, and restore from the snapshot you took before the upgrade if needed.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---------|-------|
+| No `opensearch.org/v1` cluster appears | The old cluster's `status.phase` must be `RUNNING`. Check the operator logs for messages about migration. |
+| Pods restart repeatedly after the upgrade | Check the pod log. A message about `vm.max_map_count` means the node prerequisite is not met. |
+| Pods are rejected by Pod Security admission | Values set in the cluster's own `podSecurityContext` or `securityContext` that `restricted` does not allow. |
+| Creating or changing an `opensearch.opster.io/v1` resource fails | Expected: the old group is read-only. Use `opensearch.org/v1`. |

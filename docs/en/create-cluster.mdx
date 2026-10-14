@@ -1,0 +1,232 @@
+---
+title: Create a Cluster
+weight: 30
+---
+
+# Create an OpenSearch cluster
+
+An OpenSearch cluster is described by an `OpenSearchCluster` custom resource in the `opensearch.org/v1` API group. You can create it in any namespace, because the operator watches all namespaces.
+
+Before you start, make sure that:
+
+- The operator is installed. See [Install the operator](./install.mdx).
+- `vm.max_map_count` is 262144 or higher on the nodes that will run OpenSearch.
+- You know which StorageClass to use. See [Storage](./storage.mdx).
+
+## Choose TLS or plain HTTP
+
+| | TLS enabled (recommended) | No TLS |
+|---|---|---|
+| Configuration | `spec.security.tls` with `transport` and `http` | no `spec.security.tls` |
+| REST API on port 9200 | HTTPS | plain HTTP |
+| Node-to-node traffic | encrypted with TLS | not encrypted |
+| OpenSearch security plugin | enabled: users, roles, authentication | disabled: no authentication, no access control |
+| Typical use | production, any data that needs protection | short-lived test or development clusters on a trusted network |
+
+Use TLS for any cluster that holds real data or that is reachable by more than a trusted set of clients. Without TLS, anyone who can reach the service can read, change and delete all data.
+
+## Cluster with TLS (recommended)
+
+The operator generates a certificate authority and signs the certificates for you:
+
+- `transport.generate: true` with `transport.perNode: true` issues one transport certificate per OpenSearch node.
+- `http.generate: true` issues the certificate for the REST API.
+
+{/* end of list */}
+
+```yaml
+apiVersion: opensearch.org/v1
+kind: OpenSearchCluster
+metadata:
+  name: my-cluster
+  namespace: my-namespace
+spec:
+  general:
+    serviceName: my-cluster
+    version: 3.8.0
+  security:
+    tls:
+      transport:
+        generate: true
+        perNode: true
+      http:
+        generate: true
+  dashboards:
+    enable: true
+    version: 3.8.0
+    replicas: 1
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 30Gi
+      roles:
+        - cluster_manager
+        - data
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+      persistence:
+        pvc:
+          storageClass: <storage-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+Replace `my-namespace` and `<storage-class>`, then apply the file:
+
+```bash
+kubectl apply -f my-cluster.yaml
+```
+
+Notes on the fields:
+
+- `spec.general.serviceName` is required. It is the name of the Kubernetes Service for the REST API.
+- `spec.general.version` selects the engine version: `3.8.0` (default version of this release) or `2.19.6`. Set `spec.dashboards.version` to the same version.
+- At least one node pool must have the `cluster_manager` role and `replicas` of 1 or more. Use 3 cluster-manager-eligible nodes for a highly available cluster.
+- `component` must be unique within the cluster. It is part of the names of the StatefulSet and pods (`<cluster-name>-<component>-<index>`).
+- If `jvm` is not set for a node pool, the operator sets the Java heap (`-Xms` and `-Xmx`) to half of the pool's memory request. Always set a memory request.
+- `diskSize` defaults to `30Gi` when it is not set.
+
+### Admin credentials
+
+Unless you provide your own credentials, the operator generates the password of the built-in `admin` user and stores it in a Secret named `<cluster-name>-admin-password` in the cluster's namespace, with the keys `username` and `password`.
+
+```bash
+kubectl -n my-namespace get secret my-cluster-admin-password \
+  -o jsonpath='{.data.username}' | base64 -d; echo
+kubectl -n my-namespace get secret my-cluster-admin-password \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+```
+
+To use credentials that you manage, create a Secret with the keys `username` and `password` before you create the cluster, and reference it:
+
+```yaml
+spec:
+  security:
+    config:
+      adminCredentialsSecret:
+        name: my-admin-credentials
+```
+
+### Connect to the cluster
+
+The REST API is exposed by a Service named after `spec.general.serviceName`, on port 9200 (`spec.general.httpPort`). For a quick check from a workstation:
+
+```bash
+kubectl -n my-namespace port-forward svc/my-cluster 9200:9200
+```
+
+In another terminal:
+
+```bash
+curl -k -u 'admin:<password>' https://localhost:9200/_cluster/health?pretty
+```
+
+The certificates are signed by the operator-generated CA, which your workstation does not trust; `-k` skips the verification for this test only.
+
+## Cluster without TLS
+
+If an `OpenSearchCluster` has no TLS configuration, the operator starts OpenSearch with the security plugin disabled. The REST API is served over plain HTTP on port 9200 without authentication.
+
+```yaml
+apiVersion: opensearch.org/v1
+kind: OpenSearchCluster
+metadata:
+  name: dev-cluster
+  namespace: my-namespace
+spec:
+  general:
+    serviceName: dev-cluster
+    version: 3.8.0
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 10Gi
+      roles:
+        - cluster_manager
+        - data
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: 500m
+          memory: 2Gi
+      persistence:
+        pvc:
+          storageClass: <storage-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+Check the cluster:
+
+```bash
+kubectl -n my-namespace port-forward svc/dev-cluster 9200:9200
+curl http://localhost:9200/_cluster/health?pretty
+```
+
+Things to know:
+
+- The security plugin is disabled when neither `spec.security.tls.transport` nor `spec.security.tls.http` is configured (or both are set to `enabled: false`). A `spec.security.config` section on its own does not enable it.
+- The operator still creates the `<cluster-name>-admin-password` Secret, but OpenSearch does not check credentials.
+- Decide between TLS and plain HTTP when you create the cluster. This documentation does not cover switching an existing cluster between the two modes.
+
+## OpenSearch Dashboards
+
+Set `spec.dashboards.enable: true` to deploy OpenSearch Dashboards with the cluster, as in the TLS example above. The operator:
+
+- creates a Deployment with `spec.dashboards.replicas` pods and a Service named `<serviceName>-dashboards` on port 5601;
+- connects Dashboards to the cluster with a dedicated internal user (`kibanaserver`) whose credentials it stores in the Secret `<cluster-name>-dashboards-password`.
+
+The Service type is `ClusterIP` by default. To expose Dashboards outside the cluster, set `spec.dashboards.service.type` to `NodePort` or `LoadBalancer`, or put an Ingress in front of the Service. For a quick check:
+
+```bash
+kubectl -n my-namespace port-forward svc/my-cluster-dashboards 5601:5601
+```
+
+Then open `http://localhost:5601` and log in as `admin` with the password from the `<cluster-name>-admin-password` Secret.
+
+To serve Dashboards itself over HTTPS with an operator-generated certificate, add:
+
+```yaml
+spec:
+  dashboards:
+    tls:
+      enable: true
+      generate: true
+```
+
+## Check the cluster status
+
+```bash
+kubectl -n my-namespace get opensearchclusters.opensearch.org
+kubectl -n my-namespace get pods -l opensearch.org/opensearch-cluster=my-cluster
+```
+
+When the cluster is first created, the operator starts a temporary bootstrap pod (`<cluster-name>-bootstrap-0`) to form the cluster, and removes it once the cluster has formed. The cluster is ready when `status.phase` of the `OpenSearchCluster` is `RUNNING` and all node pool pods are `Ready`.
+
+Events on the custom resource explain what the operator is doing:
+
+```bash
+kubectl -n my-namespace describe opensearchclusters.opensearch.org my-cluster
+```
+
+## Delete a cluster
+
+```bash
+kubectl -n my-namespace delete opensearchclusters.opensearch.org my-cluster
+```
+
+By default the data PVCs of the node pools are kept when the cluster is deleted. If you create a cluster with the same name in the same namespace again, it reuses those volumes and re-forms the previous cluster from the data on disk. Delete the PVCs as well if you want a fresh cluster. See [Storage](./storage.mdx).

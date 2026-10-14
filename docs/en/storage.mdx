@@ -1,0 +1,137 @@
+---
+title: Storage
+weight: 40
+---
+
+# Storage
+
+Each node pool of an `OpenSearchCluster` stores its data on a PersistentVolumeClaim (PVC) per pod. The bootstrap pod that forms a new cluster has a PVC of its own. This page explains how to choose the storage for both.
+
+## Node pool persistence
+
+Persistence is configured per node pool under `spec.nodePools[].persistence.pvc`, and the volume size under `spec.nodePools[].diskSize`:
+
+```yaml
+spec:
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 50Gi
+      roles:
+        - cluster_manager
+        - data
+      persistence:
+        pvc:
+          storageClass: <storage-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+| Field | Meaning | Default |
+|-------|---------|---------|
+| `diskSize` | Size requested for each pod's data PVC | `30Gi` |
+| `persistence.pvc.storageClass` | StorageClass of the data PVCs | the cluster's default StorageClass |
+| `persistence.pvc.accessModes` | Access modes of the data PVCs | none: always set it (normally `ReadWriteOnce`) when you set `persistence.pvc` |
+
+If you omit `persistence` entirely, the node pool gets `ReadWriteOnce` PVCs from the cluster's default StorageClass. If you set `persistence.pvc`, the operator uses its `accessModes` as given, so always include them.
+
+Each pod gets its own PVC, named `data-<cluster-name>-<component>-<index>`.
+
+Different node pools can use different storage classes, for example fast local disks for data nodes and network storage for dedicated cluster-manager nodes.
+
+### Volume ownership
+
+E1 does not run an init container as root to change the owner of the data directory. Instead, the OpenSearch pods get a pod `fsGroup` of `1000` by default, and Kubernetes makes the volume group-writable for that group. This works for volumes that are mounted owned by root, such as Ceph RBD. If you set `spec.general.podSecurityContext.fsGroup` yourself, your value is used instead.
+
+## Example: Ceph RBD
+
+Use a Ceph RBD block StorageClass for data that must survive the loss of a node. Replace `<ceph-rbd-class>` with the name of the Ceph RBD StorageClass on your platform:
+
+```yaml
+spec:
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 50Gi
+      roles:
+        - cluster_manager
+        - data
+      persistence:
+        pvc:
+          storageClass: <ceph-rbd-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+Use `ReadWriteOnce`. Each OpenSearch node needs its own volume; OpenSearch replicates data between nodes itself.
+
+## Example: TopoLVM
+
+TopoLVM provides volumes on the local disks of a node. Replace `<topolvm-class>` with the name of the TopoLVM StorageClass on your platform:
+
+```yaml
+spec:
+  nodePools:
+    - component: data
+      replicas: 3
+      diskSize: 200Gi
+      roles:
+        - data
+      persistence:
+        pvc:
+          storageClass: <topolvm-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+A local volume ties its pod to the node where the volume was created. If that node fails, the pod cannot start elsewhere until the volume is removed. Keep at least one replica of every index (`number_of_replicas` of 1 or more) and spread the pods of a node pool over different nodes, for example with `spec.nodePools[].affinity`, so that the cluster keeps all data when one node is lost.
+
+## Bootstrap pod storage
+
+When a cluster is created, the operator starts a temporary bootstrap pod that forms the cluster. It stores its data on a PVC named `<cluster-name>-bootstrap-data`. The operator creates this PVC when the cluster is created and deletes it, together with the bootstrap pod, once the cluster has formed.
+
+```yaml
+spec:
+  bootstrap:
+    storageClass: <storage-class>
+    diskSize: 1Gi
+```
+
+| Field | Meaning | Default |
+|-------|---------|---------|
+| `spec.bootstrap.storageClass` | StorageClass of the bootstrap PVC | see below |
+| `spec.bootstrap.diskSize` | Size of the bootstrap PVC | `1Gi` |
+
+If `spec.bootstrap.storageClass` is not set, the bootstrap PVC uses, in this order:
+
+1. the storage class of the first node pool with the `cluster_manager` (or `master`) role that sets `persistence.pvc.storageClass`;
+2. otherwise, the storage class of the first node pool that sets one;
+3. otherwise, the cluster's default StorageClass.
+
+In most cases you do not need to set `spec.bootstrap.storageClass`. Set it when the cluster-manager pool uses a class that is not suitable for the bootstrap pod.
+
+## Expand the volumes of a node pool
+
+To increase the disk size of a node pool, increase its `diskSize` and apply the change. The operator resizes the PVCs of that pool. Requirements:
+
+- The StorageClass must have `allowVolumeExpansion: true`.
+- You can only increase the size. Kubernetes does not shrink PVCs.
+- Keep the same unit (for example `Gi`) as the current value.
+- Back up your data before the expansion and avoid other changes to the cluster at the same time.
+
+## Things you cannot change
+
+- **The storage class of an existing node pool.** The operator's admission webhook rejects a change to `persistence.pvc.storageClass` of an existing node pool, because the storage class of a StatefulSet's volumes cannot be changed. To use another storage class, create a new cluster with that class and move the data to it, for example with snapshot and restore.
+- **The access mode of existing PVCs.** Kubernetes does not allow it.
+
+## PVCs after the cluster is deleted
+
+By default, the data PVCs of a cluster's node pools are not deleted when the `OpenSearchCluster` is deleted. If you create a cluster with the same name in the same namespace again, the new pods reuse those PVCs, and the nodes re-form the previous cluster from the data on disk; no bootstrap pod is started in that case.
+
+To remove the data, delete the PVCs after the cluster:
+
+```bash
+kubectl -n my-namespace delete pvc -l opensearch.org/opensearch-cluster=my-cluster
+```
+
+You can change this behaviour with `spec.general.persistentVolumeClaimRetentionPolicy`, which is passed to the StatefulSets of the node pools (see the Kubernetes documentation on StatefulSet PVC retention).

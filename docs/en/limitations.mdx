@@ -1,0 +1,60 @@
+---
+title: Known Limitations
+weight: 60
+---
+
+# Known limitations
+
+## Platform and installation
+
+- **Supported platform.** E1 3.0 is supported on ACP 4.4.
+- **Install mode.** The operator supports only the `AllNamespaces` install mode. It watches `OpenSearchCluster` and related resources in every namespace. You cannot restrict it to a single namespace or a list of namespaces.
+
+## Node prerequisite: vm.max_map_count
+
+- Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher. The operator does not set it.
+- `spec.general.setVMMaxMapCount` has no effect in this distribution: the privileged init container that upstream uses to set the value is never created.
+
+See [Set vm.max_map_count on nodes](./install.mdx#set-vmmax_map_count-on-nodes).
+
+## Security
+
+- **No TLS means no security plugin.** A cluster without `spec.security.tls.transport` or `spec.security.tls.http` runs with the OpenSearch security plugin disabled. It serves plain HTTP on the REST port, without authentication or access control. A `spec.security.config` section without TLS does not enable the security plugin.
+- This handling applies to the OpenSearch nodes. The operator does not change the OpenSearch Dashboards security configuration for a cluster without TLS.
+- **Pod Security.** The default security contexts are compatible with the Kubernetes `restricted` Pod Security level. Settings in your custom resource override the defaults field by field; settings that `restricted` does not allow (for example running as root, privileged containers, added capabilities or `hostPath` volumes) make the pods incompatible with a namespace that enforces `restricted`.
+- **No root init container for volume ownership.** Data volumes are made writable through the pod `fsGroup` (default `1000`). If you run OpenSearch as another user or group, set `spec.general.podSecurityContext.fsGroup` to match.
+
+## Upgrade from 2.8.0
+
+- **The `opensearch.opster.io/v1` API group is read-only.** After the upgrade, creating resources in the old group, or changing the `spec` of existing ones, is rejected by a validating webhook. Use `opensearch.org/v1`.
+- **Spec changes are not synchronized.** After the migration, the `opensearch.org/v1` resource is the only one that is reconciled. Changes are never copied back to the old resource.
+- **Resources that are not ready are not migrated.** A cluster is migrated only when its phase is `RUNNING`; other resources only when their state is `CREATED`.
+- **One rolling restart per node pool** is unavoidable during the upgrade.
+- **No automated rollback** to operator 2.8.0.
+
+See [Upgrade from 2.8.0](./upgrade-from-2.8.mdx).
+
+## Cluster changes that are rejected or not possible
+
+The operator's validating webhook rejects the following:
+
+- A change to `persistence.pvc.storageClass` of an existing node pool. To use another storage class, create a new cluster and move the data, for example with snapshot and restore.
+- A change of `spec.general.version` to a lower version (downgrade), or that skips more than one major version.
+- A change of `spec.general.version` while a custom image is set for the cluster; change or remove the custom image instead.
+- A cluster without any node pool that has the `cluster_manager` (or `master`) role and `replicas` of 1 or more.
+- Two node pools with the same `component` name.
+- Node roles other than: `cluster_manager`, `master`, `data`, `data_content`, `data_hot`, `data_warm`, `data_cold`, `data_frozen`, `ingest`, `ml`, `remote_cluster_client`, `transform`, `search`, `warm`.
+- TLS enabled for transport or HTTP without either `generate: true` or a `secret`.
+
+Storage:
+
+- PVCs can only be expanded, not shrunk, and only when the StorageClass allows volume expansion.
+- The access mode of existing PVCs cannot be changed.
+
+## Data lifecycle
+
+- By default, the data PVCs of a deleted cluster are kept. A new cluster with the same name in the same namespace reuses them and comes back with the old data. Delete the PVCs if you want a fresh cluster.
+
+## Engine versions
+
+- E1 3.0 ships OpenSearch and OpenSearch Dashboards 3.8.0 (default) and 2.19.6. Use the same version for Dashboards as for the cluster.

@@ -1,0 +1,151 @@
+---
+title: Install the Operator
+weight: 20
+---
+
+# Install the operator
+
+Alauda Data Services Search Engine E1 is installed through Operator Lifecycle Manager (OLM) from the platform's OperatorHub.
+
+## Prerequisites
+
+- An ACP 4.4 cluster.
+- On every node that can run OpenSearch pods, the kernel setting `vm.max_map_count` is 262144 or higher. See [Set vm.max_map_count on nodes](#set-vmmax_map_count-on-nodes).
+- A StorageClass for the OpenSearch data volumes. See [Storage](./storage.mdx).
+
+## Installation facts
+
+| Item | Value |
+|------|-------|
+| OLM package | `opensearch-operator` |
+| Channels | `stable` (default), `alpha` |
+| Install mode | `AllNamespaces` only (the operator watches all namespaces) |
+| Suggested namespace | `opensearch-system` |
+
+The operator ships validating admission webhooks for its custom resources. OLM provisions the webhook serving certificates; you do not need to install cert-manager.
+
+## Install from the web console
+
+1. In the ACP web console, open the OperatorHub in the Marketplace.
+2. Find **Alauda Data Services Search Engine E1** and open it.
+3. Click **Install**.
+4. Select the `stable` channel and the `AllNamespaces` install mode. Use the suggested namespace `opensearch-system` unless you have a reason to use another.
+5. Confirm the installation and wait until the operator status is **Succeeded**.
+
+If **Alauda Data Services Search Engine E1** is not listed, ask your platform administrator to make the package available in the platform marketplace.
+
+## Install with kubectl
+
+If you prefer to install from the command line, create the namespace, an OperatorGroup for all namespaces, and a Subscription. Replace `<catalog-source>` and `<catalog-namespace>` with the catalog source that provides the `opensearch-operator` package on your platform.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opensearch-system
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: opensearch-operator
+  namespace: opensearch-system
+spec: {}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: opensearch-operator
+  namespace: opensearch-system
+spec:
+  name: opensearch-operator
+  channel: stable
+  source: <catalog-source>
+  sourceNamespace: <catalog-namespace>
+  installPlanApproval: Manual
+```
+
+An OperatorGroup with an empty `spec` selects all namespaces, which matches the only install mode the operator supports.
+
+With `installPlanApproval: Manual`, approve the InstallPlan that OLM creates:
+
+```bash
+kubectl -n opensearch-system get installplan
+kubectl -n opensearch-system patch installplan <installplan-name> \
+  --type merge -p '{"spec":{"approved":true}}'
+```
+
+Check that the operator is running:
+
+```bash
+kubectl -n opensearch-system get csv
+kubectl -n opensearch-system get pods
+```
+
+The ClusterServiceVersion `opensearch-operator.v3.0.0` must reach the phase `Succeeded`.
+
+## Pod Security \{#pod-security\}
+
+The operator pod itself runs as non-root with the `RuntimeDefault` seccomp profile, no privilege escalation, all capabilities dropped and a read-only root file system.
+
+For the pods it creates (OpenSearch node pools, the bootstrap pod, the security configuration job and OpenSearch Dashboards), the operator fills in the following defaults when your `OpenSearchCluster` leaves the field unset:
+
+| Level | Field | Default |
+|-------|-------|---------|
+| Pod | `runAsNonRoot` | `true` |
+| Pod | `runAsUser` | `1000` |
+| Pod | `seccompProfile.type` | `RuntimeDefault` |
+| Pod (OpenSearch pods only) | `fsGroup` | `1000` |
+| Container | `allowPrivilegeEscalation` | `false` |
+| Container | `capabilities.drop` | `["ALL"]` |
+
+With these defaults the pods are compatible with the Kubernetes `restricted` Pod Security level, so you can create clusters in namespaces labelled `pod-security.kubernetes.io/enforce=restricted`.
+
+Values you set yourself always take precedence, field by field:
+
+- `spec.general.podSecurityContext` and `spec.general.securityContext` for OpenSearch pods.
+- `spec.dashboards.podSecurityContext` and `spec.dashboards.securityContext` for OpenSearch Dashboards.
+
+If you set values that the `restricted` level does not allow (for example `runAsUser: 0`, `privileged: true`, added capabilities, or `hostPath` persistence), the pods are no longer compatible with `restricted` and are rejected in a namespace that enforces it.
+
+The upstream operator runs an init container as root to change the owner of the data directory. E1 does not run it. Instead, data volumes are made writable through the pod `fsGroup` (default `1000`). If you run OpenSearch with a different user or group, set `spec.general.podSecurityContext.fsGroup` accordingly.
+
+## Set vm.max_map_count on nodes \{#set-vmmax_map_count-on-nodes\}
+
+OpenSearch requires the Linux kernel setting `vm.max_map_count` to be at least `262144`. The upstream operator sets it with a privileged init container. E1 does not run that container, whatever the value of `spec.general.setVMMaxMapCount`, because a privileged container is not allowed by the `restricted` Pod Security level. You must set the value on the nodes before you create clusters.
+
+### Check the current value
+
+On a node:
+
+```bash
+sysctl vm.max_map_count
+```
+
+Or from a workstation with `kubectl`, using a node debug pod. Replace `<node-name>` and use any small image that contains `sysctl` and is available to your cluster:
+
+```bash
+kubectl debug node/<node-name> -it --image=<image> -- sysctl vm.max_map_count
+```
+
+Delete the debug pod after the check (`kubectl get pods` shows it with a `node-debugger-` prefix).
+
+To list the value on all nodes, run the command on each node with your usual node administration tooling.
+
+### Set the value persistently
+
+On each node that can run OpenSearch pods, run as root:
+
+```bash
+echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-opensearch.conf
+sysctl --system
+sysctl vm.max_map_count
+```
+
+If you use a node selector, affinity or tolerations to place OpenSearch on dedicated nodes, you only need to configure those nodes. Nodes added to the cluster later need the same setting.
+
+If the value is too low, OpenSearch nodes fail their startup bootstrap checks and the pods restart repeatedly. The pod log contains a message similar to `max virtual memory areas vm.max_map_count [65530] is too low, increase to at least [262144]`.
+
+## Next steps
+
+- [Create a cluster](./create-cluster.mdx)
+- [Storage](./storage.mdx)
