@@ -59,6 +59,19 @@ Storage:
 
 - E1 3.0 ships OpenSearch and OpenSearch Dashboards 3.8.0 (default) and 2.19.6. Use the same version for Dashboards as for the cluster.
 
+## Plugins not included {#plugins-not-included}
+
+The OpenSearch and OpenSearch Dashboards images in E1 3.0 do not include these plugins, which are part of the upstream distribution:
+
+- **Security Analytics** (`opensearch-security-analytics`, and `securityAnalyticsDashboards` in Dashboards).
+- **Skills** (`opensearch-skills`), the tool set used by ML Commons agents.
+
+Features that depend on them are not available. All other plugins of the upstream distribution are included.
+
+## Resource changes roll one pod at a time {#rolling-restart-pace}
+
+Changing the resources, version or configuration of a node pool makes the operator restart the pods one at a time, waiting for each pod to rejoin and the cluster to be healthy before the next one. Expect roughly 3 to 4 minutes per pod; a cluster with 9 pods takes about half an hour to finish.
+
 ---
 
 OpenSearch® is a registered trademark of LF Projects, LLC.
