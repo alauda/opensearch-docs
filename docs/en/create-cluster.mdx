@@ -230,3 +230,7 @@ kubectl -n my-namespace delete opensearchclusters.opensearch.org my-cluster
 ```
 
 By default the data PVCs of the node pools are kept when the cluster is deleted. If you create a cluster with the same name in the same namespace again, it reuses those volumes and re-forms the previous cluster from the data on disk. Delete the PVCs as well if you want a fresh cluster. See [Storage](./storage.mdx).
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.
