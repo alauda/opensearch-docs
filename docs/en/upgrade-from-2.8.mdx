@@ -184,3 +184,7 @@ If the upgrade fails, collect the operator logs and the cluster events, keep the
 | Pods restart repeatedly after the upgrade | Check the pod log. A message about `vm.max_map_count` means the node prerequisite is not met. |
 | Pods are rejected by Pod Security admission | Values set in the cluster's own `podSecurityContext` or `securityContext` that `restricted` does not allow. |
 | Creating or changing an `opensearch.opster.io/v1` resource fails | Expected: the old group is read-only. Use `opensearch.org/v1`. |
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.
