@@ -208,6 +208,24 @@ spec:
       generate: true
 ```
 
+### Dashboards waits for another migration \{#dashboards-migration-lock\}
+
+On first start, Dashboards creates its saved-objects index (for example `.kibana_1`) on the cluster. If a Dashboards pod is stopped in the middle of that step, the next start logs a message like this and never becomes ready:
+
+```text
+Another OpenSearch Dashboards instance appears to be migrating the index. Waiting for that migration to complete.
+If no other OpenSearch Dashboards instance is attempting migrations, you can get past this message by deleting index .kibana_1 and restarting OpenSearch Dashboards.
+```
+
+E1 gives Dashboards enough startup time for this step, so a new cluster does not run into it. If a cluster is already in this state, check that no Dashboards pod is still starting, delete the index named in the message, then restart Dashboards:
+
+```bash
+curl -k -u 'admin:<password>' -X DELETE https://localhost:9200/.kibana_1
+kubectl -n my-namespace rollout restart deployment my-cluster-dashboards
+```
+
+Only delete the index the message names. Deleting it removes the saved objects stored in it, so do this only on a Dashboards instance that has never come up.
+
 ## Check the cluster status
 
 ```bash
