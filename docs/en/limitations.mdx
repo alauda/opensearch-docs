@@ -59,6 +59,10 @@ Storage:
 
 - E1 3.0 ships OpenSearch and OpenSearch Dashboards 3.8.0 (default) and 2.19.6. Use the same version for Dashboards as for the cluster.
 
+## Image settings in the cluster spec \{#image-overrides\}
+
+Do not set `spec.general.defaultRepo`, `spec.general.image`, `spec.dashboards.image` or the node pool image settings in an `OpenSearchCluster`. E1 ships its own builds of the OpenSearch and OpenSearch Dashboards images, and the operator selects them from `spec.general.version`; the platform then pulls them from the cluster's registry. When `spec.general.defaultRepo` is set, the operator falls back to the plain version tag (for example `opensearch:3.8.0`), which is not in the platform registry, so the pods cannot pull their image. An explicit image setting is used exactly as written and bypasses the images E1 ships.
+
 ## Plugins not included \{#plugins-not-included\}
 
 The OpenSearch and OpenSearch Dashboards images in E1 3.0 do not include these plugins, which are part of the upstream distribution:
