@@ -1,0 +1,61 @@
+---
+weight: 11
+i18n:
+  title:
+    en: Release Notes
+title: Release Notes
+---
+
+# Release Notes
+
+## v3.0.0-acp.1
+
+Supported on Alauda Container Platform 4.2 and 4.4, on `amd64` nodes.
+
+| Component | Version | Image tag |
+|---|---|---|
+| Operator | OpenSearch Kubernetes Operator 3.0 (upstream v3.0.0) | `opensearch-operator:v3.0.0-acp.1` |
+| OpenSearch engine | 3.8.0 (default) | `opensearch:3.8.0-alauda.1.g25fad300` |
+| OpenSearch engine | 2.19.6 | `opensearch:2.19.6-alauda.1.g25fad300` |
+| OpenSearch Dashboards | 3.8.0 | `opensearch-dashboards:3.8.0-alauda.1.g25fad300` |
+| OpenSearch Dashboards | 2.19.6 | `opensearch-dashboards:2.19.6-alauda.1.g25fad300` |
+| Init helper | BusyBox 1.38.0 | `busybox:1.38.0-alauda.1.g25fad300` |
+
+### New and Optimized Features
+
+- **OLM operator package.** The product is delivered as the OLM package `opensearch-operator`, display name **Alauda Data Services Search Engine E1**, channels `stable` (default) and `alpha`, and installs from **OperatorHub**. See [Installation](./installation.mdx).
+- **New API group `opensearch.org/v1`.** The operator is based on upstream OpenSearch Kubernetes Operator 3.0, which manages its resources in the `opensearch.org/v1` API group instead of `opensearch.opster.io/v1`.
+- **In-place upgrade from operator 2.8.0.** Existing `opensearch.opster.io/v1` resources are migrated to `opensearch.org/v1` automatically, and the old API group becomes read-only. See [Upgrade](./upgrade.mdx).
+- **Restricted Pod Security by default.** The pods the operator creates get security contexts that are compatible with the Kubernetes `restricted` Pod Security level, unless the custom resource sets those fields. See [Pod Security for the created pods](./installation.mdx#pod_security).
+- **No privileged init containers.** `vm.max_map_count` is a node prerequisite instead of a privileged init container, and data volumes are made writable through the pod `fsGroup` instead of a root init container. See [Set vm.max_map_count on nodes](./installation.mdx#set_vm_max_map_count).
+- **Images from the platform registry.** The operator selects the engine, Dashboards and init helper images that this release ships from `spec.general.version`, so they follow the platform's image registry, including in disconnected environments.
+- **Engine images built from source.** The OpenSearch and OpenSearch Dashboards images are built by Alauda, with dependencies updated for security fixes. They do not include the Security Analytics and Skills plugins. See [Plugins not included](./limitations.mdx#plugins_not_included).
+
+### Fixed Issues
+
+- **A cluster without TLS started with the demo security configuration.** A cluster with no TLS configuration now runs with the security plugin disabled, instead of starting with the image's demo security configuration. See [Create a Cluster](./functions/create_cluster.mdx).
+- **The bootstrap pod's PVC used the default StorageClass.** If `spec.bootstrap.storageClass` is not set, the bootstrap PVC now uses the storage class of the cluster-manager node pool. See [Storage](./functions/storage.mdx).
+- **Dashboards could be restarted during its first index migration.** Dashboards now starts after the cluster has formed, and its startup probe allows enough time for the saved-objects migration, so the migration is not interrupted. See [Dashboards waits for another migration](./trouble_shooting/dashboards_migration_lock.mdx).
+- **The operator Deployment is renamed `opensearch-operator-manager`.** This makes the in-place upgrade from operator 2.8.0 possible, because the Deployment selector cannot change in place. Update any monitoring or automation that refers to the operator Deployment by name.
+
+### Security Fixes
+
+At release, vulnerabilities that have a drop-in fix are fixed in all images. The following are not fixed in this release and are planned for a later patch release:
+
+- **OpenSearch Dashboards.** npm dependencies that need a major version upgrade, or that have no upstream fix yet, including CVE-2026-85061 (critical, `maplibre-gl`). OpenSearch Dashboards 2.19.6 runs on Node.js 18, which is end-of-life upstream, and also contains a Node.js 14 fallback runtime affected by CVE-2024-3566 (critical, Windows only).
+- **OpenSearch engine 3.8.0.** Jackson and Apache HttpComponents versions shaded inside jars of the security and notifications plugins.
+- **BusyBox 1.38.0.** CVE-2025-60876, CVE-2026-38753, CVE-2026-38754 and CVE-2026-38755, which have no upstream fix yet.
+- **Operator.** GO-2026-5932 in `golang.org/x/crypto/openpgp`, which has no fixed version.
+
+### Known Issues
+
+- **`vm.max_map_count` must be set on the nodes.** `spec.general.setVMMaxMapCount` has no effect.
+- **Do not set image overrides.** If `spec.general.defaultRepo` or an image is set in an `OpenSearchCluster`, the pods can fail to pull their images. See [Image settings in the cluster spec](./limitations.mdx#image_overrides).
+- **Resource changes roll one pod at a time**, about 3 to 4 minutes per pod. See [Known Limitations](./limitations.mdx#rolling_restart_pace).
+- **No automated rollback** to operator 2.8.0. See [Upgrade](./upgrade.mdx#rollback).
+
+For the complete list, see [Known Limitations](./limitations.mdx).
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.

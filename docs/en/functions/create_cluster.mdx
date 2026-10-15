@@ -1,6 +1,9 @@
 ---
+weight: 10
+i18n:
+  title:
+    en: Create a Cluster
 title: Create a Cluster
-weight: 30
 ---
 
 # Create an OpenSearch cluster
@@ -9,7 +12,7 @@ An OpenSearch cluster is described by an `OpenSearchCluster` custom resource in 
 
 Before you start, make sure that:
 
-- The operator is installed. See [Install the operator](./install.mdx).
+- The operator is installed. See [Installation](../installation.mdx).
 - `vm.max_map_count` is 262144 or higher on the nodes that will run OpenSearch.
 - You know which StorageClass to use. See [Storage](./storage.mdx).
 
@@ -208,23 +211,9 @@ spec:
       generate: true
 ```
 
-### Dashboards waits for another migration \{#dashboards-migration-lock\}
+### Dashboards does not become ready
 
-On first start, Dashboards creates its saved-objects index (for example `.kibana_1`) on the cluster. If that step is interrupted, for example because the pod is stopped or its connection to the cluster drops before OpenSearch answers, every later attempt logs a message like this and Dashboards never becomes ready:
-
-```text
-Another OpenSearch Dashboards instance appears to be migrating the index. Waiting for that migration to complete.
-If no other OpenSearch Dashboards instance is attempting migrations, you can get past this message by deleting index .kibana_1 and restarting OpenSearch Dashboards.
-```
-
-E1 starts Dashboards only after the cluster has formed and the temporary bootstrap pod is gone, and gives it enough startup time for this step, so a new cluster does not run into it. Clusters created with an earlier E1 candidate can still be in this state. If a cluster is in this state, check that no Dashboards pod is still starting, delete the index named in the message, then restart Dashboards:
-
-```bash
-curl -k -u 'admin:<password>' -X DELETE https://localhost:9200/.kibana_1
-kubectl -n my-namespace rollout restart deployment my-cluster-dashboards
-```
-
-Only delete the index the message names. Deleting it removes the saved objects stored in it, so do this only on a Dashboards instance that has never come up.
+If Dashboards keeps logging that another instance is migrating its index and never becomes ready, see [Dashboards waits for another migration](../trouble_shooting/dashboards_migration_lock.mdx).
 
 ## Check the cluster status
 

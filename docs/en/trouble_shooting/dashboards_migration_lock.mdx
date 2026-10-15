@@ -1,0 +1,43 @@
+---
+weight: 10
+---
+
+# Dashboards waits for another migration
+
+## Symptom
+
+An OpenSearch Dashboards pod never becomes ready, and its log repeats a message like this:
+
+```text
+Another OpenSearch Dashboards instance appears to be migrating the index. Waiting for that migration to complete.
+If no other OpenSearch Dashboards instance is attempting migrations, you can get past this message by deleting index .kibana_1 and restarting OpenSearch Dashboards.
+```
+
+## Cause
+
+On first start, Dashboards creates its saved-objects index (for example `.kibana_1`) on the cluster. If that step is interrupted, for example because the pod is stopped or its connection to the cluster drops before OpenSearch answers, the index is left behind in an unfinished state. Every later start finds it and waits for a migration that no other instance is running.
+
+E1 starts Dashboards only after the cluster has formed and the temporary bootstrap pod is gone, and gives Dashboards enough startup time for this step, so a new cluster normally does not run into it.
+
+## Resolution
+
+1. Check that no other Dashboards pod of the same cluster is still starting.
+2. Delete the index named in the message. Replace `<password>` with the admin password from the `<cluster-name>-admin-password` Secret, and run the command against the cluster's REST port, for example through `kubectl port-forward`:
+
+   ```bash
+   curl -k -u 'admin:<password>' -X DELETE https://localhost:9200/.kibana_1
+   ```
+
+3. Restart Dashboards:
+
+   ```bash
+   kubectl -n my-namespace rollout restart deployment my-cluster-dashboards
+   ```
+
+:::warning
+Only delete the index that the message names. Deleting it removes the saved objects stored in it, so do this only on a Dashboards instance that has never come up.
+:::
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.

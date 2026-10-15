@@ -1,9 +1,12 @@
 ---
+weight: 1
+i18n:
+  title:
+    en: Introduction
 title: Introduction
-weight: 10
 ---
 
-# Alauda Data Services Search Engine E1
+# Introduction
 
 Alauda Data Services Search Engine E1 is a distribution of the OpenSearch® Kubernetes operator, built from source by Alauda. It deploys, configures and operates OpenSearch clusters and OpenSearch Dashboards on Alauda Container Platform (ACP).
 
@@ -32,15 +35,19 @@ The operator manages the following custom resources in the `opensearch.org/v1` A
 
 E1 keeps the upstream operator's API and behaviour, with these defaults changed for ACP:
 
-- **Restricted Pod Security by default.** OpenSearch, bootstrap, security-update and Dashboards pods get a security context that is compatible with the Kubernetes `restricted` Pod Security level, unless your custom resource sets those fields itself. See [Install the operator](./install.mdx).
+- **Restricted Pod Security by default.** OpenSearch, bootstrap, security-update and Dashboards pods get a security context that is compatible with the Kubernetes `restricted` Pod Security level, unless your custom resource sets those fields itself. See [Installation](./installation.mdx).
 - **`vm.max_map_count` is a node prerequisite.** The operator does not run the privileged init container that upstream uses to set `vm.max_map_count`. Each node that runs OpenSearch must already have `vm.max_map_count` set to 262144 or more.
 - **Writable data volumes without a root init container.** The operator sets a default pod `fsGroup` of `1000`, so volumes that are mounted owned by root (for example Ceph RBD) are writable by OpenSearch.
-- **A cluster without TLS runs with the security plugin disabled.** If an `OpenSearchCluster` has no TLS configuration, its nodes serve plain HTTP with the security plugin disabled, instead of starting with the image's demo security configuration. See [Create a cluster](./create-cluster.mdx).
-- **The bootstrap PVC inherits a storage class.** If `spec.bootstrap.storageClass` is not set, the bootstrap pod's PVC uses the storage class of the cluster-manager node pool. See [Storage](./storage.mdx).
+- **A cluster without TLS runs with the security plugin disabled.** If an `OpenSearchCluster` has no TLS configuration, its nodes serve plain HTTP with the security plugin disabled, instead of starting with the image's demo security configuration. See [Create a cluster](./functions/create_cluster.mdx).
+- **The bootstrap PVC inherits a storage class.** If `spec.bootstrap.storageClass` is not set, the bootstrap pod's PVC uses the storage class of the cluster-manager node pool. See [Storage](./functions/storage.mdx).
 
 ## Upgrading from operator 2.8.0
 
-Operator 2.8.0 used the `opensearch.opster.io/v1` API group. E1 3.0 uses `opensearch.org/v1` and migrates existing resources automatically. See [Upgrade from 2.8.0](./upgrade-from-2.8.mdx).
+Operator 2.8.0 used the `opensearch.opster.io/v1` API group. E1 3.0 uses `opensearch.org/v1` and migrates existing resources automatically. See [Upgrade](./upgrade.mdx).
+
+## Limitations
+
+The operator supports only the `AllNamespaces` install mode, needs `vm.max_map_count` set on the nodes, and does not ship the Security Analytics and Skills plugins. See [Known Limitations](./limitations.mdx) for the complete list.
 
 ## Source code and license
 
