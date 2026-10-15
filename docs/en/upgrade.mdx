@@ -1,9 +1,12 @@
 ---
-title: Upgrade from 2.8.0
-weight: 50
+weight: 4
+i18n:
+  title:
+    en: Upgrade
+title: Upgrade
 ---
 
-# Upgrade from operator 2.8.0
+# Upgrade
 
 This page describes the in-place upgrade from operator 2.8.0 to Alauda Data Services Search Engine E1 3.0.
 
@@ -66,7 +69,7 @@ For every recreated StatefulSet the operator records a `Warning` event with the 
 
 Check each item on every Kubernetes cluster you are going to upgrade.
 
-1. **Set `vm.max_map_count` on the nodes.** E1 does not run the privileged init container that set `vm.max_map_count` in 2.8.0, whatever the value of `spec.general.setVMMaxMapCount`. Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher **before** the upgrade; otherwise the pods fail to start after their restart. See [Set vm.max_map_count on nodes](./install.mdx#set-vmmax_map_count-on-nodes).
+1. **Set `vm.max_map_count` on the nodes.** E1 does not run the privileged init container that set `vm.max_map_count` in 2.8.0, whatever the value of `spec.general.setVMMaxMapCount`. Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher **before** the upgrade; otherwise the pods fail to start after their restart. See [Set vm.max_map_count on nodes](./installation.mdx#set_vm_max_map_count).
 
 2. **All clusters are healthy and `RUNNING`.** Clusters that are not `RUNNING` are not migrated until they are.
 
@@ -94,7 +97,7 @@ Check each item on every Kubernetes cluster you are going to upgrade.
 
 7. **Check clusters without TLS.** In E1 3.0, a cluster whose spec has no TLS configuration (no `spec.security.tls.transport` or `spec.security.tls.http`) runs with the OpenSearch security plugin disabled and serves plain HTTP without authentication. If such a cluster relied on the security plugin, resolve this before you upgrade.
 
-8. **Check your Pod Security settings.** After the restart, the OpenSearch and Dashboards pods run with the restricted defaults described in [Install the operator](./install.mdx#pod-security), including `fsGroup: 1000` for OpenSearch pods. If you set your own `podSecurityContext` or `securityContext`, your values still take precedence.
+8. **Check your Pod Security settings.** After the restart, the OpenSearch and Dashboards pods run with the restricted defaults described in [Installation](./installation.mdx#pod_security), including `fsGroup: 1000` for OpenSearch pods. If you set your own `podSecurityContext` or `securityContext`, your values still take precedence.
 
 9. **Plan a maintenance window.** The rolling restart can take a long time for node pools with many nodes or much data.
 

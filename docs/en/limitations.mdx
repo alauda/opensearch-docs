@@ -1,9 +1,12 @@
 ---
+weight: 12
+i18n:
+  title:
+    en: Known Limitations
 title: Known Limitations
-weight: 60
 ---
 
-# Known limitations
+# Known Limitations
 
 ## Platform and installation
 
@@ -15,7 +18,7 @@ weight: 60
 - Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher. The operator does not set it.
 - `spec.general.setVMMaxMapCount` has no effect in this distribution: the privileged init container that upstream uses to set the value is never created.
 
-See [Set vm.max_map_count on nodes](./install.mdx#set-vmmax_map_count-on-nodes).
+See [Set vm.max_map_count on nodes](./installation.mdx#set_vm_max_map_count).
 
 ## Security
 
@@ -32,7 +35,7 @@ See [Set vm.max_map_count on nodes](./install.mdx#set-vmmax_map_count-on-nodes).
 - **One rolling restart per node pool** is unavoidable during the upgrade.
 - **No automated rollback** to operator 2.8.0.
 
-See [Upgrade from 2.8.0](./upgrade-from-2.8.mdx).
+See [Upgrade](./upgrade.mdx).
 
 ## Cluster changes that are rejected or not possible
 
@@ -59,11 +62,11 @@ Storage:
 
 - E1 3.0 ships OpenSearch and OpenSearch Dashboards 3.8.0 (default) and 2.19.6. Use the same version for Dashboards as for the cluster.
 
-## Image settings in the cluster spec \{#image-overrides\}
+## Image settings in the cluster spec \{#image_overrides\}
 
 Do not set `spec.general.defaultRepo`, `spec.general.image`, `spec.dashboards.image` or the node pool image settings in an `OpenSearchCluster`. E1 ships its own builds of the OpenSearch and OpenSearch Dashboards images, and the operator selects them from `spec.general.version`; the platform then pulls them from the cluster's registry. When `spec.general.defaultRepo` is set, the operator falls back to the plain version tag (for example `opensearch:3.8.0`), which is not in the platform registry, so the pods cannot pull their image. An explicit image setting is used exactly as written and bypasses the images E1 ships.
 
-## Plugins not included \{#plugins-not-included\}
+## Plugins not included \{#plugins_not_included\}
 
 The OpenSearch and OpenSearch Dashboards images in E1 3.0 do not include these plugins, which are part of the upstream distribution:
 
@@ -72,7 +75,7 @@ The OpenSearch and OpenSearch Dashboards images in E1 3.0 do not include these p
 
 Features that depend on them are not available. All other plugins of the upstream distribution are included.
 
-## Resource changes roll one pod at a time \{#rolling-restart-pace\}
+## Resource changes roll one pod at a time \{#rolling_restart_pace\}
 
 Changing the resources, version or configuration of a node pool makes the operator restart the pods one at a time, waiting for each pod to rejoin and the cluster to be healthy before the next one. Expect roughly 3 to 4 minutes per pod; a cluster with 9 pods takes about half an hour to finish.
 

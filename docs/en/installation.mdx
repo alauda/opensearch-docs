@@ -1,17 +1,20 @@
 ---
-title: Install the Operator
-weight: 20
+weight: 3
+i18n:
+  title:
+    en: Installation
+title: Installation
 ---
 
-# Install the operator
+# Installation
 
 Alauda Data Services Search Engine E1 is installed through Operator Lifecycle Manager (OLM) from the platform's OperatorHub.
 
 ## Prerequisites
 
 - An ACP 4.2 or ACP 4.4 cluster on amd64 nodes.
-- On every node that can run OpenSearch pods, the kernel setting `vm.max_map_count` is 262144 or higher. See [Set vm.max_map_count on nodes](#set-vmmax_map_count-on-nodes).
-- A StorageClass for the OpenSearch data volumes. See [Storage](./storage.mdx).
+- On every node that can run OpenSearch pods, the kernel setting `vm.max_map_count` is 262144 or higher. See [Set vm.max_map_count on nodes](#set_vm_max_map_count).
+- A StorageClass for the OpenSearch data volumes. See [Storage](./functions/storage.mdx).
 
 ## Installation facts
 
@@ -24,7 +27,7 @@ Alauda Data Services Search Engine E1 is installed through Operator Lifecycle Ma
 
 The operator ships validating admission webhooks for its custom resources. OLM provisions the webhook serving certificates; you do not need to install cert-manager.
 
-## Install from the web console
+## Install in the web console
 
 1. In the ACP web console, open the OperatorHub in the Marketplace.
 2. Find **Alauda Data Services Search Engine E1** and open it.
@@ -34,7 +37,7 @@ The operator ships validating admission webhooks for its custom resources. OLM p
 
 If **Alauda Data Services Search Engine E1** is not listed, ask your platform administrator to make the package available in the platform marketplace.
 
-## Install with kubectl
+## Install using the CLI
 
 If you prefer to install from the command line, create the namespace, an OperatorGroup for all namespaces, and a Subscription. Replace `<catalog-source>` and `<catalog-namespace>` with the catalog source that provides the `opensearch-operator` package on your platform.
 
@@ -81,9 +84,9 @@ kubectl -n opensearch-system get csv
 kubectl -n opensearch-system get pods
 ```
 
-The ClusterServiceVersion `opensearch-operator.v3.0.0` must reach the phase `Succeeded`.
+The ClusterServiceVersion `opensearch-operator.v3.0.0-acp.1` must reach the phase `Succeeded`.
 
-## Pod Security \{#pod-security\}
+## Pod Security for the created pods \{#pod_security\}
 
 The operator pod itself runs as non-root with the `RuntimeDefault` seccomp profile, no privilege escalation, all capabilities dropped and a read-only root file system.
 
@@ -109,7 +112,7 @@ If you set values that the `restricted` level does not allow (for example `runAs
 
 The upstream operator runs an init container as root to change the owner of the data directory. E1 does not run it. Instead, data volumes are made writable through the pod `fsGroup` (default `1000`). If you run OpenSearch with a different user or group, set `spec.general.podSecurityContext.fsGroup` accordingly.
 
-## Set vm.max_map_count on nodes \{#set-vmmax_map_count-on-nodes\}
+## Set vm.max_map_count on nodes \{#set_vm_max_map_count\}
 
 OpenSearch requires the Linux kernel setting `vm.max_map_count` to be at least `262144`. The upstream operator sets it with a privileged init container. E1 does not run that container, whatever the value of `spec.general.setVMMaxMapCount`, because a privileged container is not allowed by the `restricted` Pod Security level. You must set the value on the nodes before you create clusters.
 
@@ -145,10 +148,38 @@ If you use a node selector, affinity or tolerations to place OpenSearch on dedic
 
 If the value is too low, OpenSearch nodes fail their startup bootstrap checks and the pods restart repeatedly. The pod log contains a message similar to `max virtual memory areas vm.max_map_count [65530] is too low, increase to at least [262144]`.
 
+## Uninstall
+
+Uninstall in this order: delete the clusters, then the operator, then the custom resource definitions (CRDs).
+
+1. Delete every `OpenSearchCluster` and the related custom resources in all namespaces. List them first:
+
+   ```bash
+   kubectl get opensearchclusters.opensearch.org -A
+   kubectl -n <namespace> delete opensearchclusters.opensearch.org <cluster-name>
+   ```
+
+   The data PVCs are kept. Delete them as well if you no longer need the data. See [Storage](./functions/storage.mdx).
+
+2. Delete the operator. In the web console, uninstall **Alauda Data Services Search Engine E1** from the OperatorHub. With kubectl, delete the Subscription and the ClusterServiceVersion:
+
+   ```bash
+   kubectl -n opensearch-system delete subscription opensearch-operator
+   kubectl -n opensearch-system delete csv opensearch-operator.v3.0.0-acp.1
+   ```
+
+3. Optional: delete the CRDs. OLM does not delete them when the operator is uninstalled. Deleting a CRD deletes every remaining resource of that kind in the cluster, so do this only after step 1.
+
+   ```bash
+   kubectl get crd -o name | grep -E 'opensearch\.org|opensearch\.opster\.io'
+   ```
+
+   Delete the CRDs that the command lists with `kubectl delete`.
+
 ## Next steps
 
-- [Create a cluster](./create-cluster.mdx)
-- [Storage](./storage.mdx)
+- [Create a cluster](./functions/create_cluster.mdx)
+- [Storage](./functions/storage.mdx)
 
 ---
 
