@@ -161,6 +161,12 @@ Uninstall in this order: delete the clusters, then the operator, then the custom
 
    The data PVCs are kept. Delete them as well if you no longer need the data. See [Storage](./functions/storage.mdx).
 
+   If the cluster was upgraded from operator 2.8.0, the operator also deletes its `opensearch.opster.io` copy. Wait until the following command lists nothing before you continue, because the copies cannot be deleted after the operator is removed:
+
+   ```bash
+   kubectl get opensearchclusters.opensearch.opster.io -A
+   ```
+
 2. Delete the operator. In the web console, uninstall **Alauda Data Services Search Engine E1** from the OperatorHub. With kubectl, delete the Subscription and the ClusterServiceVersion:
 
    ```bash
