@@ -70,7 +70,7 @@ For every recreated StatefulSet the operator records a `Warning` event with the 
 Check each item on every Kubernetes cluster you are going to upgrade.
 
 :::warning
-If the operator Subscription uses **automatic** approval, OLM upgrades the operator to E1 as soon as E1 is available in the platform catalog, before you can complete this checklist. Switch the Subscription to manual approval first:
+The upgrade starts when you switch the Subscription's channel to `stable` (see [Upgrade the operator](#upgrade_the_operator)). If the Subscription uses **automatic** approval, the upgrade starts at once. Complete this checklist first, and switch the Subscription to manual approval so that you decide when the upgrade starts:
 
 ```bash
 kubectl -n <operator-namespace> patch subscription <subscription-name> \
@@ -112,11 +112,20 @@ kubectl -n <operator-namespace> patch subscription <subscription-name> \
 
 10. **Update your automation.** Scripts, GitOps repositories and Helm charts that create or modify `opensearch.opster.io/v1` resources fail after the upgrade. Switch them to `opensearch.org/v1`, and switch label selectors from `opster.io/...` to `opensearch.org/...`.
 
-## Upgrade the operator
+## Upgrade the operator \{#upgrade_the_operator\}
 
-E1 3.0 is published in the same OLM package (`opensearch-operator`) on both the `stable` and `alpha` channels, and it is marked as able to replace any 2.8.x version. An existing 2.8.0 subscription on either channel is offered the upgrade.
+E1 3.0 is published in the same OLM package (`opensearch-operator`) on the `stable` channel only, and it is marked as able to replace any 2.8.x version. Operator 2.8.0 is on the `alpha` channel, which stays at 2.8.0, so a 2.8.0 Subscription is not upgraded until you switch its channel to `stable`:
 
-- With automatic approval, OLM upgrades the operator as soon as the new version is available in the catalog.
+```bash
+kubectl -n <operator-namespace> patch subscription <subscription-name> \
+  --type merge -p '{"spec":{"channel":"stable"}}'
+```
+
+:::warning
+The platform log storage (OpenSearch log storage of the platform logging feature) uses operator 2.8.0 on the `alpha` channel and creates `opensearch.opster.io/v1` clusters, which E1 makes read-only. Do not switch the Subscription that the platform log storage uses to `stable`.
+:::
+
+- With automatic approval, OLM upgrades the operator as soon as the channel is switched.
 - With manual approval, approve the pending InstallPlan in the web console, or with kubectl:
 
   ```bash
@@ -125,13 +134,13 @@ E1 3.0 is published in the same OLM package (`opensearch-operator`) on both the 
     --type merge -p '{"spec":{"approved":true}}'
   ```
 
-If no upgrade is offered, check that the subscription's catalog source provides the E1 3.0 bundle. OLM only offers upgrades from the catalog source and channel that the subscription refers to.
+If no upgrade is offered, check that the subscription's channel is `stable` and that its catalog source provides the E1 3.0 bundle. OLM only offers upgrades from the catalog source and channel that the subscription refers to.
 
-If your 2.8.0 subscription points to a different catalog source than the one that publishes E1, OLM never offers the upgrade, because it does not move a subscription between catalog sources. Edit the subscription so that `spec.source` and `spec.sourceNamespace` name the catalog source that publishes E1, and keep `spec.channel` (`alpha`, or `stable`):
+If your 2.8.0 subscription points to a different catalog source than the one that publishes E1, OLM never offers the upgrade, because it does not move a subscription between catalog sources. Edit the subscription so that `spec.source` and `spec.sourceNamespace` name the catalog source that publishes E1, and set `spec.channel` to `stable`:
 
 ```bash
 kubectl -n <operator-namespace> patch subscription <subscription-name> --type merge \
-  -p '{"spec":{"source":"<catalog-source>","sourceNamespace":"<catalog-namespace>"}}'
+  -p '{"spec":{"source":"<catalog-source>","sourceNamespace":"<catalog-namespace>","channel":"stable"}}'
 ```
 
 Wait until the new ClusterServiceVersion is `Succeeded`:
