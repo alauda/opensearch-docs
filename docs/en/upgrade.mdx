@@ -65,9 +65,18 @@ The restart uses the regular rolling-restart procedure: one pod at a time, waiti
 
 For every recreated StatefulSet the operator records a `Warning` event with the reason `StatefulSetRecreated` on the cluster, followed by `RollingRestart` events. If an OpenSearch version upgrade is in progress at the same time, the version upgrade restarts the pods instead.
 
-## Before the upgrade
+## Before the upgrade \{#before_the_upgrade\}
 
 Check each item on every Kubernetes cluster you are going to upgrade.
+
+:::warning
+If the operator Subscription uses **automatic** approval, OLM upgrades the operator to E1 as soon as E1 is available in the platform catalog, before you can complete this checklist. Switch the Subscription to manual approval first:
+
+```bash
+kubectl -n <operator-namespace> patch subscription <subscription-name> \
+  --type merge -p '{"spec":{"installPlanApproval":"Manual"}}'
+```
+:::
 
 1. **Set `vm.max_map_count` on the nodes.** E1 does not run the privileged init container that set `vm.max_map_count` in 2.8.0, whatever the value of `spec.general.setVMMaxMapCount`. Every node that runs OpenSearch must have `vm.max_map_count` of 262144 or higher **before** the upgrade; otherwise the pods fail to start after their restart. See [Set vm.max_map_count on nodes](./installation.mdx#set_vm_max_map_count).
 
