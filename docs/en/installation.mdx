@@ -84,7 +84,7 @@ kubectl -n opensearch-system get csv
 kubectl -n opensearch-system get pods
 ```
 
-The ClusterServiceVersion `opensearch-operator.v3.0.0-acp.2` must reach the phase `Succeeded`.
+The ClusterServiceVersion `opensearch-operator.v3.0.0-acp.3` must reach the phase `Succeeded`.
 
 ## Pod Security for the created pods \{#pod_security\}
 
@@ -171,7 +171,7 @@ Uninstall in this order: delete the clusters, then the operator, then the custom
 
    ```bash
    kubectl -n opensearch-system delete subscription opensearch-operator
-   kubectl -n opensearch-system delete csv opensearch-operator.v3.0.0-acp.2
+   kubectl -n opensearch-system delete csv opensearch-operator.v3.0.0-acp.3
    ```
 
 3. Optional: delete the CRDs. OLM does not delete them when the operator is uninstalled. Deleting a CRD deletes every remaining resource of that kind in the cluster, so do this only after step 1.
