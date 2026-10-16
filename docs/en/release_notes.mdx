@@ -8,13 +8,13 @@ title: Release Notes
 
 # Release Notes
 
-## v3.0.0-acp.2
+## v3.0.0-acp.3
 
 Supported on Alauda Container Platform 4.1, 4.2, 4.3 and 4.4, on `amd64` and `arm64` nodes, on IPv4, IPv6 and dual-stack clusters.
 
 | Component | Version | Image tag |
 |---|---|---|
-| Operator | OpenSearch Kubernetes Operator 3.0 (upstream v3.0.0) | `opensearch-operator:v3.0.0-acp.2` |
+| Operator | OpenSearch Kubernetes Operator 3.0 (upstream v3.0.0) | `opensearch-operator:v3.0.0-acp.3` |
 | OpenSearch engine | 3.8.0 (default) | `opensearch:3.8.0-alauda.1.g25fad300` |
 | OpenSearch engine | 2.19.6 | `opensearch:2.19.6-alauda.1.g25fad300` |
 | OpenSearch Dashboards | 3.8.0 | `opensearch-dashboards:3.8.0-alauda.1.g25fad300` |
@@ -36,6 +36,7 @@ Supported on Alauda Container Platform 4.1, 4.2, 4.3 and 4.4, on `amd64` and `ar
 - **A cluster without TLS started with the demo security configuration.** A cluster with no TLS configuration now runs with the security plugin disabled, instead of starting with the image's demo security configuration. See [Create a Cluster](./functions/create_cluster.mdx).
 - **The bootstrap pod's PVC had no StorageClass.** On a platform cluster without a default StorageClass, it never bound and the cluster never formed. If `spec.bootstrap.storageClass` is not set, the bootstrap PVC now uses the storage class of the cluster-manager node pool. See [Storage](./functions/storage.mdx).
 - **Dashboards could wait forever for its first index migration on a new cluster.** The migration was interrupted when the bootstrap pod was removed, or when the startup probe restarted Dashboards before the migration finished. Dashboards now starts only after the cluster has formed and the bootstrap pod is removed, and its startup probe allows 30 minutes for the saved-objects migration. See [Dashboards waits for another migration](./trouble_shooting/dashboards_migration_lock.mdx).
+- **OpenSearch Dashboards never became ready on IPv6-only clusters.** It listened on IPv4 only, so its startup probe failed. On a cluster whose primary IP family is IPv6, Dashboards now listens on IPv6. A `SERVER_HOST` set in `spec.dashboards.env` still takes precedence.
 - **The operator Deployment is renamed `opensearch-operator-manager`.** This makes the in-place upgrade from operator 2.8.0 possible, because the Deployment selector cannot change in place. Update any monitoring or automation that refers to the operator Deployment by name.
 
 ### Security Fixes
