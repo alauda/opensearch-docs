@@ -43,7 +43,7 @@ Supported on Alauda Container Platform 4.1, 4.2, 4.3 and 4.4, on `amd64` and `ar
 
 At release, vulnerabilities that have a drop-in fix are fixed in all images. The following are not fixed in this release and are planned for a later patch release:
 
-- **OpenSearch Dashboards.** npm dependencies that need a major version upgrade, or that have no upstream fix yet, including CVE-2026-85061 (critical, `maplibre-gl`). OpenSearch Dashboards 2.19.6 runs on Node.js 18, which is end-of-life upstream and has known vulnerabilities that are fixed only in newer Node.js versions. It also contains a Node.js 14 fallback runtime affected by CVE-2024-3566 (critical, Windows only).
+- **OpenSearch Dashboards.** npm dependencies that need a major version upgrade, or that have no upstream fix yet, including CVE-2026-85061 (critical, `maplibre-gl`; see [Mitigating CVE-2026-85061](#mitigating_cve_2026_85061)). OpenSearch Dashboards 2.19.6 runs on Node.js 18, which is end-of-life upstream and has known vulnerabilities that are fixed only in newer Node.js versions. It also contains a Node.js 14 fallback runtime affected by CVE-2024-3566 (critical, Windows only).
 - **OpenSearch engine 3.8.0.** Jackson and Apache HttpComponents versions shaded inside jars of the security and notifications plugins.
 - **BusyBox 1.38.0.** CVE-2025-60876, CVE-2026-38753, CVE-2026-38754 and CVE-2026-38755, which have no upstream fix yet.
 - **Operator.** GO-2026-5932 in `golang.org/x/crypto/openpgp`, which has no fixed version.
@@ -54,6 +54,58 @@ At release, vulnerabilities that have a drop-in fix are fixed in all images. The
 - **Do not set image overrides.** If `spec.general.defaultRepo` or an image is set in an `OpenSearchCluster`, the pods can fail to pull their images. See [Image settings in the cluster spec](./limitations.mdx#image_overrides).
 - **Resource changes roll one pod at a time**, about 3 to 4 minutes per pod. See [Known Limitations](./limitations.mdx#rolling_restart_pace).
 - **No automated rollback** to operator 2.8.0. See [Upgrade](./upgrade.mdx#rollback).
+- **CVE-2026-85061 in the Dashboards Maps plugin is not fixed.** See [Mitigating CVE-2026-85061](#mitigating_cve_2026_85061).
+
+#### Mitigating CVE-2026-85061 \{#mitigating_cve_2026_85061\}
+
+CVE-2026-85061 (critical) is a cross-site scripting flaw in `maplibre-gl`, which the Maps plugin (`customImportMapDashboards`) of OpenSearch Dashboards 3.8.0 and 2.19.6 uses to draw maps. HTML in a map's attribution text can keep an event-handler attribute, such as `onload` or `ontoggle`, after it is sanitized. The handler runs in the browser of a user who opens a map that shows this attribution. To exploit the flaw, an attacker must control the attribution of a map: the attribution of a custom layer in a saved map, or the attribution in a map style from an external tile service.
+
+The following measures were verified on E1 3.0 with both Dashboards versions.
+
+**1. Keep the default Content Security Policy.** Dashboards sends an enforced `Content-Security-Policy` header on its pages, including the Maps app. The header does not allow `'unsafe-inline'` for scripts, so browsers do not run inline event handlers:
+
+| Dashboards | Script directives in the default header |
+|---|---|
+| 3.8.0 | `script-src 'self'; script-src-attr 'none'` |
+| 2.19.6 | `script-src 'unsafe-eval' 'self'` |
+
+In a browser test on E1 Dashboards, `ontoggle`, `onload` and `onerror` handlers inserted into the page as HTML did not run: the browser blocked each one as a `script-src-attr` violation. The same markup ran on a page without this header. Therefore:
+
+- Do not add `'unsafe-inline'` to the script directives, for example through `csp.rules` in `spec.dashboards.additionalConfig`.
+- Do not remove or replace the header in a reverse proxy or Ingress in front of Dashboards.
+- Use a current browser. A browser that does not enforce Content Security Policy is not protected by this measure.
+
+**2. Restrict who can create or change maps.** Maps, including the attribution of their custom layers, are saved objects in the Dashboards index. The built-in `kibana_user` role, and `all_access`, can create and change them. Map users who only need to view dashboards and maps to a read-only role instead, and do not map them to `kibana_user` as well; roles add up. For example, with the security plugin REST API:
+
+```bash
+curl -k -u admin:<admin-password> -X PUT \
+  "https://<cluster-service>:9200/_plugins/_security/api/roles/dashboards_read_only" \
+  -H 'Content-Type: application/json' -d '{
+    "cluster_permissions": ["cluster_composite_ops_ro"],
+    "index_permissions": [{
+      "index_patterns": [".kibana", ".kibana_*", ".opensearch_dashboards", ".opensearch_dashboards_*"],
+      "allowed_actions": ["read"]
+    }],
+    "tenant_permissions": [{
+      "tenant_patterns": ["global_tenant"],
+      "allowed_actions": ["kibana_all_read"]
+    }]
+  }'
+
+curl -k -u admin:<admin-password> -X PUT \
+  "https://<cluster-service>:9200/_plugins/_security/api/rolesmapping/dashboards_read_only" \
+  -H 'Content-Type: application/json' -d '{"users": ["<user>"]}'
+```
+
+A user who has only this role can log in to Dashboards and open existing maps. Creating, changing or importing a map is rejected with a `no permissions for [indices:data/write/...]` error. Give `kibana_user` and `all_access` only to trusted users.
+
+This measure needs the security plugin. A cluster without TLS configuration runs with the security plugin disabled (see [Create a Cluster](./functions/create_cluster.mdx)), so anyone who can reach its Dashboards can create maps. For such a cluster, rely on measure 1 and limit network access to Dashboards.
+
+**What does not mitigate the flaw:**
+
+- The Maps plugin cannot be disabled through configuration. Setting `custom_import_map_dashboards.enabled: "false"` in `spec.dashboards.additionalConfig` makes Dashboards fail to start with `ValidationError: [config validation of [custom_import_map_dashboards].enabled]: definition for this key is missing`. Do not set it.
+- `map.includeOpenSearchMapsService: "false"` is accepted, but the Maps plugin does not use this setting, so it does not change what the Maps app loads.
+
 
 For the complete list, see [Known Limitations](./limitations.mdx).
 
