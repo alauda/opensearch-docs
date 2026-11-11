@@ -1,0 +1,200 @@
+---
+weight: 30
+i18n:
+  title:
+    en: Snapshots to S3
+title: Snapshots to S3
+---
+
+# Snapshots to S3
+
+OpenSearch backs up data as snapshots in a snapshot repository. This page explains how to store snapshots in S3-compatible object storage, such as Amazon S3, Ceph Object Storage (RGW) or MinIO, and how to take them on a schedule with `OpensearchSnapshotPolicy`.
+
+## The `repository-s3` plugin is not included \{#plugin_not_included\}
+
+An S3 snapshot repository needs the `repository-s3` plugin on every OpenSearch node. The OpenSearch images in E1 do not include it, and the upstream OpenSearch distribution does not include it either. Until you install it, OpenSearch rejects a repository of type `s3`.
+
+To see the plugins in a running cluster:
+
+```bash
+kubectl -n <namespace> exec <cluster-name>-<node-pool>-0 -c opensearch -- \
+  /usr/share/opensearch/bin/opensearch-plugin list
+```
+
+## Overview
+
+| Step | Field | Purpose |
+|------|-------|---------|
+| 1 | `spec.general.pluginsList` | Installs `repository-s3` on every node |
+| 2 | `spec.general.keystore` | Puts the S3 access key and secret key into the OpenSearch keystore |
+| 3 | `spec.general.additionalConfig` | Sets the S3 client settings (endpoint, path style, protocol, region) |
+| 4 | `spec.general.snapshotRepositories` | Registers the snapshot repository after the cluster is running |
+| 5 | `OpensearchSnapshotPolicy` | Takes and deletes snapshots on a schedule |
+
+Steps 1 to 3 change the pod template, so the operator restarts the cluster pods one at a time (see [Resource changes roll one pod at a time](../limitations.mdx#rolling_restart_pace)). To avoid that restart, set them when you create the cluster.
+
+## Step 1: Install the plugin \{#install_plugin\}
+
+Add the plugin to `spec.general.pluginsList`:
+
+```yaml
+spec:
+  general:
+    pluginsList:
+      - <url-of-repository-s3-zip>
+```
+
+The operator runs `opensearch-plugin install --batch <items>` **every time a node container starts**, and starts OpenSearch only after the install succeeds. Each item is either a plugin name or the URL of a plugin zip file:
+
+- **Plugin name** (`repository-s3`): the zip is downloaded from `artifacts.opensearch.org`. This works only if the pods can reach the internet.
+- **URL of a zip file**: the zip is downloaded from that URL. Use this in an air-gapped environment.
+
+:::warning
+If the download fails, the node does not start. This applies to every later restart as well, so the URL must stay reachable from the pods for the life of the cluster.
+:::
+
+In an air-gapped environment:
+
+1. Download the plugin zip of **exactly** the cluster's OpenSearch version, for example:
+   - `https://artifacts.opensearch.org/releases/plugins/repository-s3/3.8.0/repository-s3-3.8.0.zip`
+   - `https://artifacts.opensearch.org/releases/plugins/repository-s3/2.19.6/repository-s3-2.19.6.zip`
+2. Serve it from an HTTP(S) server that the pods can reach, for example an internal object storage bucket or artifact repository.
+3. Put that URL in `spec.general.pluginsList`.
+
+A plugin of another version is refused, so when you upgrade `spec.general.version`, change the URL to the zip of the new version in the same edit.
+
+The bootstrap pod that forms a new cluster uses `spec.general.pluginsList` too, unless `spec.bootstrap.pluginsList` is set.
+
+## Step 2: Add the S3 credentials \{#credentials\}
+
+Store the access key and secret key in a Secret in the cluster's namespace:
+
+```bash
+kubectl -n <namespace> create secret generic opensearch-s3-credentials \
+  --from-literal=accessKey=<access-key> \
+  --from-literal=secretKey=<secret-key>
+```
+
+Map them to the keystore keys of the `default` S3 client:
+
+```yaml
+spec:
+  general:
+    keystore:
+      - secret:
+          name: opensearch-s3-credentials
+        keyMappings:
+          accessKey: s3.client.default.access_key
+          secretKey: s3.client.default.secret_key
+```
+
+The operator builds the keystore in an init container each time a pod starts, so a changed Secret takes effect when the pods restart. With `keyMappings`, only the listed keys are loaded.
+
+## Step 3: Point the client at your object storage \{#client_settings\}
+
+For Amazon S3, the defaults usually work. For Ceph Object Storage, MinIO or other S3-compatible storage, set the client settings through `spec.general.additionalConfig`, and turn off the EC2 metadata lookup with an environment variable on each node pool:
+
+```yaml
+spec:
+  general:
+    additionalConfig:
+      s3.client.default.endpoint: <host>:<port>
+      s3.client.default.protocol: http
+      s3.client.default.path_style_access: "true"
+      s3.client.default.region: us-east-1
+  nodePools:
+    - component: masters
+      env:
+        - name: AWS_EC2_METADATA_DISABLED
+          value: "true"
+      # ...
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `s3.client.default.endpoint` | Host and port of the S3 service, without the scheme |
+| `s3.client.default.protocol` | `http` or `https` |
+| `s3.client.default.path_style_access` | `"true"` for services that do not support virtual-hosted bucket names, which is common for Ceph RGW and MinIO |
+| `s3.client.default.region` | Required by the client. For non-AWS storage, any value works |
+
+## Step 4: Register the repository \{#repository\}
+
+Declare the repository in `spec.general.snapshotRepositories`. Once the cluster is `RUNNING`, the operator creates the repository through the OpenSearch API, and updates it when the settings change:
+
+```yaml
+spec:
+  general:
+    snapshotRepositories:
+      - name: s3-backup
+        type: s3
+        settings:
+          bucket: <bucket>
+          base_path: <cluster-name>
+```
+
+The bucket must already exist, and the credentials must allow listing the bucket and reading, writing and deleting objects in it. If the operator cannot create the repository, for example because the plugin is missing, it records a `Warning` event on the `OpenSearchCluster` and retries.
+
+Check the repository:
+
+```bash
+GET _snapshot/s3-backup
+POST _snapshot/s3-backup/_verify
+```
+
+## Step 5: Take snapshots on a schedule \{#snapshot_policy\}
+
+Create an `OpensearchSnapshotPolicy` in the same namespace as the cluster. Its `snapshotConfig.repository` must name a repository that already exists, such as the one from Step 4:
+
+```yaml
+apiVersion: opensearch.org/v1
+kind: OpensearchSnapshotPolicy
+metadata:
+  name: daily
+  namespace: <namespace>
+spec:
+  policyName: daily
+  opensearchCluster:
+    name: <cluster-name>
+  enabled: true
+  creation:
+    schedule:
+      cron:
+        expression: "0 1 * * *"
+        timezone: "UTC"
+  deletion:
+    schedule:
+      cron:
+        expression: "0 3 * * *"
+        timezone: "UTC"
+    deleteCondition:
+      maxAge: "7d"
+      minCount: 3
+  snapshotConfig:
+    repository: s3-backup
+    indices: "*"
+    includeGlobalState: true
+```
+
+For a one-off snapshot, for example before an upgrade, use the OpenSearch API directly:
+
+```bash
+PUT _snapshot/s3-backup/before-upgrade?wait_for_completion=true
+```
+
+## Restore
+
+Restore through the OpenSearch API. An index that is open in the cluster cannot be restored over, so close or delete it first, or restore under a new name with `rename_pattern` and `rename_replacement`:
+
+```bash
+GET _snapshot/s3-backup/_all
+POST _snapshot/s3-backup/<snapshot>/_restore
+{
+  "indices": "<index-pattern>"
+}
+```
+
+A snapshot can be restored into a cluster of the same OpenSearch version or a newer compatible one. To restore into another cluster, register the same repository there as well. Test restores regularly: a successful snapshot does not prove that the data can be restored.
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.
