@@ -1,0 +1,753 @@
+---
+weight: 10
+i18n:
+  title:
+    en: Migrate from Elasticsearch to OpenSearch
+title: Migrate from Elasticsearch to OpenSearch
+---
+
+# Migrate from Elasticsearch to OpenSearch
+
+This guide describes how to migrate data from Elasticsearch (ES) 7.10 or 8.x to **Alauda Data Services Search Engine E1 3.0**, which manages `OpenSearchCluster` resources in the `opensearch.org/v1` API group and ships OpenSearch **3.8.0** (default) and **2.19.6**.
+
+Before creating a target OpenSearch cluster, make sure that:
+
+- Alauda Data Services Search Engine E1 3.0 is installed, and `vm.max_map_count` is set to `262144` or higher on every node that runs OpenSearch pods. See [Installation](../installation.mdx) and [Set vm.max_map_count on nodes](../installation.mdx#set_vm_max_map_count).
+- You have chosen a `StorageClass` and reviewed the cluster specification requirements in [Create a Cluster](../functions/create_cluster.mdx), [Storage](../functions/storage.mdx), and [Known Limitations](../limitations.mdx).
+- You do **not** set `spec.general.defaultRepo`, `spec.general.image`, `spec.dashboards.image`, or node pool image overrides in `OpenSearchCluster`. E1 selects its shipped images from `spec.general.version`; see [Image settings in the cluster spec](../limitations.mdx#image_overrides).
+
+:::note
+
+**Use the fully qualified resource name in `kubectl`.** Always specify `opensearchclusters.opensearch.org` in `kubectl` commands (`get`, `edit`, `describe`, `delete`). On Kubernetes clusters upgraded from operator 2.8.0, the legacy `opensearchclusters.opensearch.opster.io` CRD remains installed as read-only, and a bare `opensearchcluster` name can resolve to the deprecated API group. See [Upgrade](../upgrade.mdx).
+
+:::
+
+## Migration strategy overview \{#migration_strategy\}
+
+E1 3.0 supports two migration mechanisms. Choose the mechanism that matches your source version, dataset size, and connectivity constraints, then follow the corresponding section.
+
+| Source version | Target version in E1 3.0 | Migration method | Notes |
+| :--- | :--- | :--- | :--- |
+| **Elasticsearch 7.10** | **OpenSearch 2.19.6** | [Snapshot and Restore](#snapshot_and_restore) | Direct restore supported |
+| **Elasticsearch 7.10** | **OpenSearch 3.8.0** | [Snapshot and Restore](#snapshot_and_restore) → Reindex → Upgrade | Must restore to OpenSearch `2.19.6`, reindex every restored index there, take a backup snapshot, then upgrade to `3.8.0` |
+| **Elasticsearch 7.10** | **OpenSearch 3.8.0** | [Reindex from Remote](#reindex_from_remote) | Single step directly to `3.8.0` without an intermediate `2.19.6` cluster |
+| **Elasticsearch 8.x** | **OpenSearch 3.8.0** | [Reindex from Remote](#reindex_from_remote) | Direct migration supported |
+
+### Choosing a method \{#choosing_a_method\}
+
+**Snapshot and Restore** copies the underlying shard files through S3-compatible object storage. It is much faster for large datasets and preserves index settings, mappings, custom analyzers, and aliases. Its main constraint is index version compatibility: OpenSearch 3.x can only open indices created by OpenSearch 2.0.0 or later, so an Elasticsearch 7.10 index must first be restored into OpenSearch `2.19.6` and reindexed there before upgrading the cluster to `3.8.0`. It also requires an S3-compatible bucket reachable from both clusters and the `repository-s3` plugin on every node.
+
+**Reindex from Remote** reads documents over HTTP(S) from the source cluster and indexes them as new documents on the target cluster. Because every document is indexed afresh on the target, the source's on-disk index version never matters — which is why it can migrate from Elasticsearch 7.10 straight to OpenSearch `3.8.0` in a single step, and why it is the only supported path from Elasticsearch 8.x. In exchange, it pays the full indexing cost for every document over the network, requires HTTP(S) connectivity from OpenSearch pods to the source cluster's REST port, needs no object storage or `repository-s3` plugin, and copies **documents only** — index settings, mappings, custom analyzers, and aliases must be created on the target cluster beforehand.
+
+:::warning
+
+- **Direct Elasticsearch 7.10 → OpenSearch 3.8.0 snapshot restore is not supported.** OpenSearch 3.x requires indices to have been created with OpenSearch 2.0.0 or later. Restoring an Elasticsearch 7.10 snapshot directly into `3.8.0` fails with:
+
+  ```text
+  snapshot_restore_exception: cannot restore index [...] because it cannot be upgraded; created with version [7.10.2]
+  ```
+
+  Restore the snapshot to OpenSearch `2.19.6` first, reindex every restored index there, and then upgrade the cluster to `3.8.0` — or use [Reindex from Remote](#reindex_from_remote) instead.
+- **OpenSearch cannot restore snapshots taken by Elasticsearch 8.x.** Use [Reindex from Remote](#reindex_from_remote) for any Elasticsearch 8.x source.
+
+:::
+
+The procedures below use Elasticsearch `7.10.2` as the example source for Snapshot and Restore and Elasticsearch `8.17.5` as the example source for Reindex from Remote. Adjust version strings to match your source cluster.
+
+## Migrate from Elasticsearch 7.10 via Snapshot and Restore \{#snapshot_and_restore\}
+
+Reaching OpenSearch `3.8.0` from Elasticsearch 7.10 via snapshots uses three phases:
+
+- **Phase 0**: Create a snapshot on the source Elasticsearch 7.10 cluster.
+- **Phase 1**: Deploy an OpenSearch `2.19.6` cluster in E1 3.0 and restore the snapshot.
+- **Phase 2**: Reindex every restored index inside OpenSearch `2.19.6`, take a writable backup snapshot, and upgrade the cluster in place to `3.8.0`.
+
+If OpenSearch `2.19.6` is your target version rather than a step toward `3.8.0`, complete Phase 0 and Phase 1 and stop there.
+
+### Prerequisites \{#snapshot_prerequisites\}
+
+- An existing bucket in S3-compatible object storage (such as Amazon S3, Ceph Object Storage RGW, or MinIO) reachable from both the source Elasticsearch 7.10 cluster and the target OpenSearch cluster.
+- The `repository-s3` plugin installed on both clusters. **Neither the E1 3.0 OpenSearch images (`2.19.6` and `3.8.0`) nor the upstream distribution include `repository-s3` by default.**
+
+#### Credentials and REST API access \{#credentials_and_api_access\}
+
+Replace `<password>` with your cluster's credentials in every `curl` command that follows:
+
+- **Elasticsearch**: the built-in superuser is `elastic`.
+- **OpenSearch with TLS enabled (recommended)**: E1 generates the password for the built-in `admin` user and stores it in the Secret `<cluster-name>-admin-password` (unless you supply your own Secret in `spec.security.config.adminCredentialsSecret`), and serves HTTPS on port `9200`. Retrieve it with:
+
+  ```bash
+  kubectl -n <namespace> get secret <cluster-name>-admin-password \
+    -o jsonpath='{.data.password}' | base64 -d; echo
+  ```
+
+- **OpenSearch without TLS**: if an `OpenSearchCluster` omits `spec.security.tls`, E1 disables the OpenSearch security plugin and serves plain HTTP on port `9200` without authentication. Replace `curl -k -u 'admin:<password>' "https://localhost:9200/..."` with `curl "http://localhost:9200/..."` in that case. See [Create a Cluster](../functions/create_cluster.mdx).
+
+#### Check installed plugins and node versions \{#check_plugins_and_versions\}
+
+Check whether `repository-s3` is already installed:
+
+```bash
+# On an Elasticsearch pod
+curl -u 'elastic:<password>' "http://localhost:9200/_cat/plugins?v"
+
+# On a running OpenSearch pod
+kubectl -n <namespace> exec <cluster-name>-<component>-0 -c opensearch -- \
+  /usr/share/opensearch/bin/opensearch-plugin list
+```
+
+Read the exact engine version on the source Elasticsearch cluster so you can fetch the matching plugin archive:
+
+```bash
+curl -s -u 'elastic:<password>' "http://localhost:9200" | grep '"number"'
+```
+
+#### Prepare the `repository-s3` plugin archives \{#install_repository_s3\}
+
+Build the plugin download URL from the exact engine version of each cluster:
+
+| Product | Version | Download URL |
+| :--- | :--- | :--- |
+| Elasticsearch | `<ES_VERSION>` (for example `7.10.2`) | `https://artifacts.elastic.co/downloads/elasticsearch-plugins/repository-s3/repository-s3-<ES_VERSION>.zip` |
+| OpenSearch (E1 3.0 Phase 1) | `2.19.6` | `https://artifacts.opensearch.org/releases/plugins/repository-s3/2.19.6/repository-s3-2.19.6.zip` |
+| OpenSearch (E1 3.0 Phase 2) | `3.8.0` | `https://artifacts.opensearch.org/releases/plugins/repository-s3/3.8.0/repository-s3-3.8.0.zip` |
+
+:::warning
+
+**Plugin version must match the node version exactly.** Both `elasticsearch-plugin install` and `opensearch-plugin install` check the exact engine version recorded inside the plugin archive and **refuse to install a package built for any other version**, including a different patch release. A version mismatch prevents the pod from starting.
+
+:::
+
+:::warning
+
+**Air-gapped environments and pod restarts.** In E1 3.0, the operator runs `opensearch-plugin install --batch <items>` **every time an OpenSearch container starts** and starts OpenSearch only after the installation succeeds:
+
+- A bare plugin name (`repository-s3`) downloads from `artifacts.opensearch.org`, which fails in an air-gapped cluster and keeps the pod from starting.
+- In an air-gapped environment, download the exact-version zip archives (`2.19.6` and `3.8.0`) beforehand and host them on an internal HTTP(S) server (for example an artifact repository, internal object storage bucket, or Nginx service) that **stays reachable from the pods for the life of the cluster**. Use those internal URLs in `spec.general.pluginsList`.
+
+:::
+
+**Install `repository-s3` on Elasticsearch 7.10 (Helm chart example):**
+
+If your source Elasticsearch 7.10 cluster is deployed via a Helm chart without `repository-s3` baked into the image, update its chart values to configure the S3 endpoint and install the plugin in an init container:
+
+```yaml
+masterNodes:
+  config:
+    elasticsearch.yml: |
+      s3.client.default.endpoint: "http://<s3-host>:<port>"
+      s3.client.default.region: "us-east-1"
+      s3.client.default.path_style_access: true
+
+extraInitContainers:
+  - name: install-plugins
+    image: <exact-image-your-elasticsearch-nodes-run>
+    command:
+      - sh
+      - -c
+      - |
+        bin/elasticsearch-plugin install --batch https://artifacts.elastic.co/downloads/elasticsearch-plugins/repository-s3/repository-s3-7.10.2.zip
+    volumeMounts:
+      - name: plugins
+        mountPath: /usr/share/elasticsearch/plugins
+
+extraVolumes:
+  - name: plugins
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: plugins
+    mountPath: /usr/share/elasticsearch/plugins
+```
+
+:::note
+
+- `extraInitContainers` **must use the exact same container image that your Elasticsearch nodes already run**. A different distribution (such as an `-oss` image against a default-distribution cluster) produces a plugin directory that the node refuses to load, and air-gapped clusters can pull only from their internal registry. Read the image directly from the running StatefulSet:
+
+  ```bash
+  kubectl -n <es-namespace> get sts <elasticsearch-sts-name> \
+    -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+  ```
+
+- Mounting an `emptyDir` at `/usr/share/elasticsearch/plugins` hides any plugins already present in the image's plugin directory, so the init container must install every plugin the cluster needs, not only `repository-s3`.
+- If your Elasticsearch cluster has dedicated data nodes (or other node groups), add the same `s3.client.default.*` entries to `dataNodes.config` as well.
+
+:::
+
+For the target OpenSearch cluster, `repository-s3` is declared directly in the `OpenSearchCluster` resource in [Phase 1](#phase_1_restore).
+
+### Phase 0: Create the snapshot on Elasticsearch 7.10 \{#phase_0_snapshot\}
+
+#### Step 1: Add S3 credentials to every Elasticsearch pod \{#es_keystore_credentials\}
+
+Store the S3 access key and secret key in the Elasticsearch keystore rather than passing them in REST request bodies.
+
+1. On **each** Elasticsearch pod, add the credentials to the keystore:
+
+   ```bash
+   bin/elasticsearch-keystore add s3.client.default.access_key
+   bin/elasticsearch-keystore add s3.client.default.secret_key
+   ```
+
+   Or non-interactively via standard input:
+
+   ```bash
+   echo "<access-key>" | bin/elasticsearch-keystore add --stdin s3.client.default.access_key
+   echo "<secret-key>" | bin/elasticsearch-keystore add --stdin s3.client.default.secret_key
+   ```
+
+2. After updating **all** Elasticsearch pods, reload the secure settings across the cluster:
+
+   ```bash
+   curl -u 'elastic:<password>' -X POST "http://localhost:9200/_nodes/reload_secure_settings"
+   ```
+
+:::warning
+
+**Repeat on every Elasticsearch pod.** `elasticsearch.keystore` is a local file inside each pod's configuration directory, and `_nodes/reload_secure_settings` reloads only what is already present on each node. **Run step 1 on every Elasticsearch pod** (both master and data nodes) before calling `_nodes/reload_secure_settings`:
+
+- `_nodes/reload_secure_settings` returns HTTP `200` even when other nodes have no S3 credentials in their keystore, so a successful reload response does not prove every node has credentials.
+- If any node is missing the keys, repository registration fails later and names the **elected master** — often a different pod from the one where you ran the command:
+
+  ```text
+  repository_verification_exception: [migration_repo] path [es_710_backup] is not accessible on master node
+  ```
+
+- Unless your deployment persists the Elasticsearch configuration directory, keystore entries stored in the container filesystem are lost whenever an Elasticsearch pod restarts and must be added again.
+
+:::
+
+#### Step 2: Register the snapshot repository on Elasticsearch 7.10 \{#es_register_repo\}
+
+```bash
+curl -u 'elastic:<password>' -X PUT "http://localhost:9200/_snapshot/migration_repo" \
+  -H 'Content-Type: application/json' -d'
+{
+  "type": "s3",
+  "settings": {
+    "bucket": "my-migration-bucket",
+    "base_path": "es_710_backup"
+  }
+}'
+```
+
+#### Step 3: Create the snapshot on Elasticsearch 7.10 \{#es_create_snapshot\}
+
+Take a snapshot that excludes Elasticsearch-specific internal indices:
+
+```bash
+curl -u 'elastic:<password>' -X PUT "http://localhost:9200/_snapshot/migration_repo/snapshot_1?wait_for_completion=true" \
+  -H 'Content-Type: application/json' -d'
+{
+  "indices": "*,-.kibana*,-.security*,-.monitoring*,-apm*,-.apm*",
+  "ignore_unavailable": true,
+  "include_global_state": true
+}'
+```
+
+:::note
+
+**Excluding Elasticsearch system indices.** The pattern `*,-.kibana*,-.security*,-.monitoring*,-apm*,-.apm*` excludes Elasticsearch system and Kibana indices that conflict with OpenSearch's own internal indices during restore. Because they are excluded, Kibana saved objects (index patterns, visualizations, dashboards) and Elasticsearch users, roles, and role mappings are not migrated and must be recreated in OpenSearch and OpenSearch Dashboards.
+
+:::
+
+### Phase 1: Restore to OpenSearch 2.19.6 \{#phase_1_restore\}
+
+#### Step 1: Create the S3 credentials Secret \{#os_s3_secret\}
+
+Create a Kubernetes Secret in the target cluster's namespace holding the S3 access key and secret key:
+
+```bash
+kubectl -n <namespace> create secret generic opensearch-s3-credentials \
+  --from-literal=accessKey='<access-key>' \
+  --from-literal=secretKey='<secret-key>'
+```
+
+#### Step 2: Deploy an OpenSearch 2.19.6 cluster \{#deploy_os_2196\}
+
+Create an `OpenSearchCluster` running engine `2.19.6` with `repository-s3`, S3 keystore mappings, S3 client settings, and a read-only `migration_repo` pointing to the snapshot path written in Phase 0. Replace `<namespace>`, `<storage-class>`, `<s3-host>:<port>`, and (in air-gapped clusters) the `pluginsList` URL:
+
+```yaml
+apiVersion: opensearch.org/v1
+kind: OpenSearchCluster
+metadata:
+  name: my-cluster
+  namespace: <namespace>
+spec:
+  general:
+    serviceName: my-cluster
+    version: 2.19.6
+    pluginsList:
+      # In air-gapped clusters, replace with an internal HTTP(S) URL serving repository-s3-2.19.6.zip
+      - https://artifacts.opensearch.org/releases/plugins/repository-s3/2.19.6/repository-s3-2.19.6.zip
+    keystore:
+      - secret:
+          name: opensearch-s3-credentials
+        keyMappings:
+          accessKey: s3.client.default.access_key
+          secretKey: s3.client.default.secret_key
+    additionalConfig:
+      # Host and port without http:// or https:// scheme; set scheme in protocol below
+      s3.client.default.endpoint: <s3-host>:<port>
+      s3.client.default.protocol: http
+      s3.client.default.path_style_access: "true"
+      s3.client.default.region: us-east-1
+    snapshotRepositories:
+      - name: migration_repo
+        type: s3
+        settings:
+          bucket: my-migration-bucket
+          base_path: es_710_backup
+          # Read-only protects the source snapshot during restore, so Phase 2 must register
+          # a separate writable repository before upgrading to 3.8.0.
+          readonly: "true"
+  security:
+    tls:
+      transport:
+        generate: true
+        perNode: true
+      http:
+        generate: true
+  dashboards:
+    enable: true
+    version: 2.19.6
+    replicas: 1
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 30Gi
+      roles:
+        - cluster_manager
+        - data
+      env:
+        # Disable EC2 instance-metadata lookup on Ceph RGW, MinIO, or other non-AWS storage
+        - name: AWS_EC2_METADATA_DISABLED
+          value: "true"
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+      persistence:
+        pvc:
+          storageClass: <storage-class>
+          accessModes:
+            - ReadWriteOnce
+```
+
+Apply the manifest and wait until `status.phase` is `RUNNING` and all pods are `Ready`:
+
+```bash
+kubectl apply -f my-cluster.yaml
+kubectl -n <namespace> get opensearchclusters.opensearch.org my-cluster -w
+kubectl -n <namespace> get pods -l opensearch.org/opensearch-cluster=my-cluster
+```
+
+Key behaviors of E1 3.0 in this configuration:
+
+- **TLS and admin credentials**: With `spec.security.tls` enabled as above, the operator automatically generates `<cluster-name>-admin-password`, injects `OPENSEARCH_INITIAL_ADMIN_PASSWORD` into the bootstrap and node pool pods from that Secret, and initializes the OpenSearch security index. Do **not** add `OPENSEARCH_INITIAL_ADMIN_PASSWORD` to `additionalConfig` — in E1 3.0 `additionalConfig` is written into `opensearch.yml`, where environment variable names are rejected as unknown OpenSearch settings. To use your own password instead of a generated one, create a Secret with keys `username` and `password` beforehand and reference it in `spec.security.config.adminCredentialsSecret.name`; see [Create a Cluster](../functions/create_cluster.mdx).
+- **Bootstrap pod plugins**: When forming a new cluster, the temporary `<cluster-name>-bootstrap-0` pod mounts the same `<cluster-name>-config` `opensearch.yml` ConfigMap and automatically inherits `spec.general.pluginsList` unless `spec.bootstrap.pluginsList` is set. If you ever set `spec.bootstrap.pluginsList` explicitly, include the same `repository-s3` archive there too, or `<cluster-name>-bootstrap-0` fails at startup with `StartupException: unknown setting [s3.client.default.region]`.
+- **S3 endpoint settings**: For Amazon S3, you can omit `endpoint`, `protocol`, `path_style_access`, and `AWS_EC2_METADATA_DISABLED`. For Ceph RGW, MinIO, and other S3-compatible services, pass `s3.client.default.endpoint` as `<host>:<port>` without a scheme, set `s3.client.default.protocol` to `http` or `https`, set `s3.client.default.path_style_access: "true"` when virtual-hosted bucket DNS is not configured, and set `AWS_EC2_METADATA_DISABLED: "true"` on every node pool.
+- **Configuration and keystore updates roll pods one at a time**: The operator writes `additionalConfig` into the `<cluster-name>-config` ConfigMap (`opensearch.yml`) and builds `opensearch.keystore` in an init container on pod startup (it does not call `_nodes/reload_secure_settings`). Adding or changing `pluginsList`, `keystore`, or `additionalConfig` on an existing cluster triggers a rolling restart of roughly 3 to 4 minutes per pod (see [Resource changes roll one pod at a time](../limitations.mdx#rolling_restart_pace)). If you update the data inside `opensearch-s3-credentials` without changing the `OpenSearchCluster` spec, restart the node pool pods so the init container rebuilds the keystore.
+- **Declarative repository registration**: Once `status.phase` reaches `RUNNING`, the operator registers `migration_repo` through the OpenSearch REST API. If registration fails (for example because the bucket name or credentials are wrong), the operator records a `Warning` event on the `OpenSearchCluster` and retries.
+
+#### Step 3: Restore the snapshot on OpenSearch 2.19.6 \{#restore_snapshot_2196\}
+
+Forward port `9200` (or run `curl` inside `my-cluster-masters-0`) and verify that `migration_repo` is registered and sees `snapshot_1`:
+
+```bash
+kubectl -n <namespace> port-forward svc/my-cluster 9200:9200
+```
+
+```bash
+curl -k -u 'admin:<password>' "https://localhost:9200/_snapshot/migration_repo/snapshot_1"
+```
+
+Restore the user indices while excluding Elasticsearch system indices and global cluster state:
+
+```bash
+curl -k -u 'admin:<password>' -X POST "https://localhost:9200/_snapshot/migration_repo/snapshot_1/_restore" \
+  -H 'Content-Type: application/json' -d'
+{
+  "indices": "-.kibana*,-.security*,-.monitoring*,-apm*,-.apm*",
+  "include_global_state": false
+}'
+```
+
+:::note
+
+- Restoring fails if an index with the same name already exists and is open on the target cluster. Close or delete the conflicting index first, or restore under a new name with `rename_pattern` and `rename_replacement`.
+- Restored indices keep the `index.number_of_replicas` setting from the source cluster. If the target cluster has fewer data nodes than the source, override the replica count in the restore body (for example `"index_settings": {"index.number_of_replicas": 1}`) so the restored indices do not remain `yellow` with unassigned replicas.
+- Because `include_global_state` is `false`, index templates, component/legacy templates, and ingest pipelines are **not** restored. Recreate the templates and pipelines your workload uses on OpenSearch, and rebuild any Elasticsearch Index Lifecycle Management (ILM) policies as OpenSearch Index State Management (ISM) policies (`OpenSearchISMPolicy`).
+
+:::
+
+#### Step 4: Verify the restored data \{#verify_phase_1\}
+
+Confirm that every expected index is `green` and its document count matches the source cluster:
+
+```bash
+curl -k -u 'admin:<password>' "https://localhost:9200/_cat/indices?v"
+curl -k -u 'admin:<password>' "https://localhost:9200/<index_name>/_count"
+```
+
+### Phase 2: Reindex and upgrade to OpenSearch 3.8.0 \{#phase_2_upgrade\}
+
+:::warning
+
+**Mandatory reindex before upgrading to 3.8.0.** Indices restored from an Elasticsearch 7.10 snapshot retain their original creation metadata (`version.created` `7100299` for Elasticsearch `7.10.2`). OpenSearch `3.8.0` requires every index in the cluster to have been created by OpenSearch 2.0.0 or later. You **must reindex every restored index** inside OpenSearch `2.19.6` before upgrading the cluster to `3.8.0`.
+
+:::
+
+#### Step 1: Reindex every restored index in OpenSearch 2.19.6 \{#reindex_in_2196\}
+
+For each restored index, export both its `settings` and `mappings`, create a fresh index on OpenSearch `2.19.6`, reindex the documents, verify the document count, and swap the original name onto an alias.
+
+:::note
+
+- Replace `migration_test` in the commands below with each restored index name.
+- Run the commands from a workstation with `jq` and `curl` over `kubectl port-forward svc/my-cluster 9200:9200` (the OpenSearch container image may not include `jq`).
+- Exporting **both `settings` and `mappings`** is required: shard counts, custom analyzers, normalizers, and similarity settings live under `settings`, not `mappings`. If an index uses a custom analysis plugin, install that plugin via `spec.general.pluginsList` before creating the `<index>_v2` index.
+- If a source index was previously produced by an Elasticsearch `_shrink` or `_split` operation, its settings also contain read-only `index.resize.*` or `index.routing.allocation.initial_recovery.*` keys; remove those keys from `index_def.json` as well if index creation rejects them.
+
+:::
+
+Run the following sequence for each restored index:
+
+```bash
+# 1. Export settings AND mappings, stripping read-only index metadata fields
+curl -sk -u 'admin:<password>' "https://localhost:9200/migration_test" | \
+  jq '.migration_test
+      | {settings: .settings, mappings: .mappings}
+      | del(.settings.index.uuid,
+            .settings.index.creation_date,
+            .settings.index.version,
+            .settings.index.provided_name)' > index_def.json
+
+# 2. Create a new OpenSearch 2.19.6 index with the exported settings and mappings
+curl -k -u 'admin:<password>' -X PUT "https://localhost:9200/migration_test_v2" \
+  -H 'Content-Type: application/json' \
+  -d @index_def.json
+
+# 3. Reindex documents from the restored index into the new index.
+#    For large indices, use wait_for_completion=false and poll GET /_tasks/<task_id>
+#    so long-running HTTP connections are not dropped by port-forward or proxies.
+curl -k -u 'admin:<password>' -X POST "https://localhost:9200/_reindex?wait_for_completion=true" \
+  -H 'Content-Type: application/json' -d'
+{
+  "source": { "index": "migration_test" },
+  "dest": { "index": "migration_test_v2" }
+}'
+
+# 4. Compare document counts BEFORE deleting the old index (the next step is destructive)
+curl -k -u 'admin:<password>' "https://localhost:9200/migration_test/_count"
+curl -k -u 'admin:<password>' "https://localhost:9200/migration_test_v2/_count"
+
+# 5. Only after the counts match: delete the 7.10-created index and add an alias with the original name
+curl -k -u 'admin:<password>' -X DELETE "https://localhost:9200/migration_test"
+curl -k -u 'admin:<password>' -X POST "https://localhost:9200/_aliases" \
+  -H 'Content-Type: application/json' -d'
+{
+  "actions": [
+    { "add": { "index": "migration_test_v2", "alias": "migration_test" } }
+  ]
+}'
+```
+
+Repeat for **every** restored index, then verify that the new index carries an OpenSearch 2.x creation version:
+
+```bash
+curl -k -u 'admin:<password>' "https://localhost:9200/migration_test_v2/_settings?filter_path=**.version"
+```
+
+`version.created` must begin with `136` (for example `136408427` on OpenSearch `2.19.6`) rather than `7100299`. Any `136xxxxxx` value confirms the index was created by OpenSearch 2.x and can be opened by OpenSearch `3.8.0`. Double-check that no `710xxxx` user indices remain before proceeding.
+
+#### Step 2: Take a pre-upgrade snapshot to a writable repository \{#pre_upgrade_snapshot\}
+
+:::warning
+
+**Register a writable backup repository first.** A major version upgrade (`2.19.6` → `3.8.0`) cannot be rolled back in place. Take a backup snapshot of the reindexed `2.19.6` cluster before upgrading.
+
+Because `migration_repo` in Phase 1 was configured with `readonly: "true"`, it **cannot** store new snapshots. Add a second, writable repository entry under `spec.general.snapshotRepositories` (it can share the same bucket as long as it uses a different `base_path` and omits `readonly`).
+
+:::
+
+Add the writable repository to `opensearchclusters.opensearch.org`:
+
+```yaml
+spec:
+  general:
+    snapshotRepositories:
+      - name: migration_repo
+        type: s3
+        settings:
+          bucket: my-migration-bucket
+          base_path: es_710_backup
+          readonly: "true"
+      - name: pre_upgrade_backup
+        type: s3
+        settings:
+          bucket: my-migration-bucket
+          base_path: os_2196_backup
+```
+
+Once the operator registers `pre_upgrade_backup`, take a snapshot:
+
+```bash
+curl -k -u 'admin:<password>' -X PUT \
+  "https://localhost:9200/_snapshot/pre_upgrade_backup/before_3_8_upgrade?wait_for_completion=true"
+```
+
+#### Step 3: Upgrade the OpenSearch cluster to 3.8.0 \{#upgrade_to_380\}
+
+Update `spec.general.version`, `spec.general.pluginsList`, and `spec.dashboards.version` on the `OpenSearchCluster` **in the same edit**:
+
+```yaml
+spec:
+  general:
+    version: 3.8.0
+    pluginsList:
+      # Update the plugin zip URL to 3.8.0 at the same time as spec.general.version
+      - https://artifacts.opensearch.org/releases/plugins/repository-s3/3.8.0/repository-s3-3.8.0.zip
+  dashboards:
+    version: 3.8.0
+```
+
+:::warning
+
+**Update the `repository-s3` archive URL in the same edit.** When `spec.general.version` changes from `2.19.6` to `3.8.0`, every restarted pod installs the URL listed in `spec.general.pluginsList` before starting OpenSearch. Leaving the `2.19.6` zip URL in place causes upgraded `3.8.0` pods to fail plugin installation on startup and enter `CrashLoopBackOff`. If you also set `spec.bootstrap.pluginsList`, update or remove it at the same time.
+
+:::
+
+Apply the update (`kubectl -n <namespace> edit opensearchclusters.opensearch.org my-cluster` or `kubectl apply -f my-cluster.yaml`). The operator performs an automated rolling upgrade across the node pools and updates the OpenSearch Dashboards Deployment.
+
+#### Step 4: Post-upgrade verification \{#verify_phase_2\}
+
+Wait until `status.phase` returns to `RUNNING` and `status.version` reports `3.8.0`, then verify cluster health and indices:
+
+```bash
+kubectl -n <namespace> get opensearchclusters.opensearch.org my-cluster
+curl -k -u 'admin:<password>' "https://localhost:9200/_cluster/health?pretty"
+curl -k -u 'admin:<password>' "https://localhost:9200/_cat/indices?v"
+```
+
+## Migrate via Reindex from Remote \{#reindex_from_remote\}
+
+OpenSearch cannot restore snapshots taken by Elasticsearch 8.x, so **Reindex from Remote** is the required migration method for any Elasticsearch 8.x source.
+
+The same procedure also works for an Elasticsearch 7.10 source and migrates directly into OpenSearch `3.8.0` in a single step without deploying an intermediate `2.19.6` cluster, S3 bucket, or `repository-s3` plugin. See [Choosing a method](#choosing_a_method) for the throughput and schema trade-offs.
+
+### Prerequisites \{#remote_reindex_prerequisites\}
+
+- **Target OpenSearch 3.8.0 cluster**: Deploy an `OpenSearchCluster` running `version: 3.8.0` in E1 3.0. See [Create a Cluster](../functions/create_cluster.mdx).
+- **Network connectivity**: All OpenSearch data/ingest pods must be able to reach the source Elasticsearch cluster's HTTP(S) REST endpoint (typically port `9200`).
+- **Source TLS scheme**: Check whether your source Elasticsearch cluster serves HTTPS (for example ECK default self-signed TLS) or plain HTTP (for example ECK with `spec.http.tls.selfSignedCertificate.disabled: true`), and match `https://` or `http://` in Step 3 accordingly.
+- **Target index settings and mappings**: `_reindex` copies documents only. Prepare the index templates or explicit index definitions (`settings`, `mappings`, custom analyzers, shard counts) to create on OpenSearch before reindexing.
+
+### Step 1: Allowlist the remote Elasticsearch endpoint \{#configure_remote_allowlist\}
+
+Edit your `OpenSearchCluster` (`kubectl -n <namespace> edit opensearchclusters.opensearch.org <cluster-name>`) and add `reindex.remote.allowlist` under `spec.general.additionalConfig`:
+
+```yaml
+spec:
+  general:
+    additionalConfig:
+      # Host and port ONLY — do NOT include http:// or https:// here.
+      # Separate multiple hosts with commas (for example "es1:9200,es2:9200").
+      reindex.remote.allowlist: "<es-host>:9200"
+      # Optional: skip TLS certificate verification if the source uses a self-signed certificate
+      reindex.ssl.verification_mode: "none"
+```
+
+:::warning
+
+**Use `reindex.remote.allowlist`, never `reindex.remote.whitelist`.** Elasticsearch and OpenSearch 1.x used `reindex.remote.whitelist`. OpenSearch 2.x kept the old name only as a deprecated alias, and **OpenSearch 3.x (`3.8.0`) removed `reindex.remote.whitelist` completely**. Copying `reindex.remote.whitelist` from Elasticsearch documentation causes the first restarted OpenSearch 3.x pod to fail immediately on startup with:
+
+```text
+org.opensearch.bootstrap.StartupException: SettingsException[unknown setting [reindex.remote.whitelist]
+  please check that any required plugins are installed, or check the breaking changes documentation
+  for removed settings]
+```
+
+Changing `additionalConfig` updates the `<cluster-name>-config` ConfigMap and rolls the cluster one pod at a time (~3 to 4 minutes per pod; see [Resource changes roll one pod at a time](../limitations.mdx#rolling_restart_pace)). Watch the first restarted pod return to `Running` and `Ready`; if it enters `CrashLoopBackOff`, the rollout halts while older pods continue serving on the previous configuration — see [Troubleshooting](#troubleshooting).
+
+:::
+
+Once all pods finish rolling, confirm that every node loaded the allowlist setting before starting the reindex:
+
+```bash
+curl -k -u 'admin:<password>' "https://localhost:9200/_nodes/settings?filter_path=**.reindex*"
+```
+
+### Step 2: Create the target index on OpenSearch \{#create_target_index\}
+
+Create the destination index — or an index template (`OpensearchIndexTemplate` or `PUT /_index_template/...`) matching its name — with your required shard counts, custom analyzers, and field mappings **before** calling `_reindex`. If the destination index does not exist, OpenSearch creates it automatically with dynamic mapping defaults, which will not preserve the source's custom analyzers, shard layout, or strict field types.
+
+### Step 3: Start the asynchronous remote reindex \{#execute_remote_reindex\}
+
+Submit the `_reindex` request on OpenSearch with `wait_for_completion=false` so it runs as a background task.
+
+Note the format difference from Step 1: `reindex.remote.allowlist` in `opensearch.yml` takes `<es-host>:9200` **without** a scheme, whereas `source.remote.host` in the `_reindex` request body **must include** `https://` or `http://`:
+
+```bash
+curl -k -u 'admin:<password>' -X POST "https://localhost:9200/_reindex?wait_for_completion=false" \
+  -H 'Content-Type: application/json' -d'
+{
+  "source": {
+    "remote": {
+      "host": "https://<es-host>:9200",
+      "username": "elastic",
+      "password": "<es-password>"
+    },
+    "index": "migration_test"
+  },
+  "dest": {
+    "index": "migration_test"
+  }
+}'
+```
+
+OpenSearch returns a task identifier:
+
+```json
+{
+  "task": "N6q0j8s-T0m0j8s-T0m0j8:123456"
+}
+```
+
+### Step 4: Monitor reindex progress \{#monitor_remote_reindex\}
+
+Poll the task endpoint until `"completed": true` and verify that `response.failures` is empty:
+
+```bash
+curl -k -u 'admin:<password>' "https://localhost:9200/_tasks/N6q0j8s-T0m0j8s-T0m0j8:123456?pretty"
+```
+
+### Step 5: Verify document counts \{#verify_remote_reindex\}
+
+Compare the document counts on OpenSearch and on the source Elasticsearch cluster:
+
+```bash
+# On OpenSearch
+curl -k -u 'admin:<password>' "https://localhost:9200/migration_test/_count"
+
+# On the source Elasticsearch cluster (use http:// if TLS is disabled on the source)
+curl -k -u 'elastic:<es-password>' "https://<es-host>:9200/migration_test/_count"
+```
+
+## Troubleshooting \{#troubleshooting\}
+
+### A pod stays in CrashLoopBackOff after a configuration change \{#crashloop_after_config_change\}
+
+#### Symptom \{#crashloop_symptom\}
+
+After editing `additionalConfig` or `pluginsList` on an `OpenSearchCluster`, one pod in a node pool enters `CrashLoopBackOff` (with a recent pod age) while the remaining pods in the same StatefulSet stay `1/1 Running` with a much older age. The cluster still answers queries through the surviving pods, and `kubectl describe opensearchclusters.opensearch.org <cluster-name>` shows a `Warning` event from `RollingRestart`:
+
+```text
+Pod '<cluster-name>-masters-2' in node pool 'masters' is in CrashLoopBackOff; rolling restart is stalled until the pod becomes ready
+```
+
+The failing pod's `opensearch` container log shows an uncaught `StartupException`, such as a removed setting name (`reindex.remote.whitelist`), an S3 setting without `repository-s3` installed (`s3.client.default.region`), or a plugin version mismatch:
+
+```text
+[ERROR][o.o.b.OpenSearchUncaughtExceptionHandler] uncaught exception in thread [main]
+org.opensearch.bootstrap.StartupException: SettingsException[unknown setting [reindex.remote.whitelist]
+  please check that any required plugins are installed, or check the breaking changes documentation
+  for removed settings]
+```
+
+#### Cause \{#crashloop_cause\}
+
+In E1 3.0, the operator renders `spec.general.additionalConfig` into the ConfigMap `<cluster-name>-config` under the key `opensearch.yml` (and merges `spec.nodePools[].additionalConfig` into a per-pool `<cluster-name>-<component>-config` ConfigMap when set), mounts it at `/usr/share/opensearch/config/opensearch.yml` via `subPath`, and updates the `opensearch.org/config` checksum annotation on each StatefulSet.
+
+The operator does not validate OpenSearch setting names before writing `opensearch.yml`. Because StatefulSets use the `OnDelete` update strategy and the operator restarts one pod at a time, the rollout stops as soon as the first restarted pod fails startup validation, leaving the remaining pods running the previous healthy revision.
+
+#### Resolution \{#crashloop_resolution\}
+
+1. Identify the stuck pod (look for mixed pod ages or `CrashLoopBackOff`) and inspect its log for the exact rejected setting or plugin error:
+
+   ```bash
+   kubectl -n <namespace> get pods -l opensearch.org/opensearch-cluster=<cluster-name>
+   kubectl -n <namespace> logs <pod-name> -c opensearch --tail=50
+   ```
+
+2. Fix the invalid entry in the `opensearch.org/v1` cluster resource:
+
+   ```bash
+   kubectl -n <namespace> edit opensearchclusters.opensearch.org <cluster-name>
+   ```
+
+3. Verify that the operator regenerated `opensearch.yml` in the ConfigMap (`<cluster-name>-config`, or `<cluster-name>-<component>-config` if that node pool sets `nodePools[].additionalConfig`) and updated the StatefulSet's configuration checksum:
+
+   ```bash
+   kubectl -n <namespace> get configmap <cluster-name>-config \
+     -o jsonpath='{.data.opensearch\.yml}'; echo
+   kubectl -n <namespace> get sts <cluster-name>-<component> \
+     -o jsonpath='{.spec.template.metadata.annotations.opensearch\.org/config}'; echo
+   ```
+
+4. Allow or trigger pod recreation. Once the StatefulSet has a new revision, E1 3.0 automatically deletes a pod stuck in `CrashLoopBackOff` on the older revision so the StatefulSet recreates it with the corrected ConfigMap. To recreate it immediately without waiting for the next reconciliation cycle:
+
+   ```bash
+   kubectl -n <namespace> delete pod <pod-name>
+   ```
+
+   (`opensearch.yml` is mounted with `subPath`, so a pod must be recreated rather than restarted in place to pick up the updated ConfigMap.)
+
+5. Watch the pod become `Ready` and confirm the rolling restart finishes across the remaining pods:
+
+   ```bash
+   kubectl -n <namespace> get pods -l opensearch.org/opensearch-cluster=<cluster-name> -w
+   ```
+
+:::note
+
+**Settings are validated one at a time.** OpenSearch stops on the first unknown setting it encounters during startup. If the pod fails again with another setting name after your fix, repeat the steps above for the next reported setting.
+
+:::
+
+## Client migration guide \{#client_migration\}
+
+Regardless of which data migration path you use, **switch client applications to the official OpenSearch client libraries**.
+
+:::warning
+
+- Elasticsearch OSS `7.10.2` clients may work with OpenSearch 1.x, while newer Elasticsearch official clients enforce product/license checks that fail against OpenSearch.
+- **For OpenSearch 2.0 and later (`2.19.6` and `3.8.0`), no Elasticsearch client library is fully compatible with OpenSearch.**
+- Always use the official OpenSearch client libraries when connecting to OpenSearch clusters.
+
+:::
+
+| Language | Official client | Documentation |
+| :--- | :--- | :--- |
+| **Python** | `opensearch-py` | [High-level](https://docs.opensearch.org/latest/clients/python-high-level/), [Low-level](https://docs.opensearch.org/latest/clients/python-low-level/) |
+| **Java** | `opensearch-java` | [Java Client](https://docs.opensearch.org/latest/clients/java/) |
+| **JavaScript** | `@opensearch-project/opensearch` | [Node.js Client](https://docs.opensearch.org/latest/clients/javascript/index) |
+| **Go** | `opensearch-go` | [Go Client](https://docs.opensearch.org/latest/clients/go/) |
+| **Ruby** | `opensearch-ruby` | [Ruby Client](https://docs.opensearch.org/latest/clients/ruby/) |
+| **PHP** | `opensearch-php` | [PHP Client](https://docs.opensearch.org/latest/clients/php/) |
+| **.NET** | `OpenSearch.Client` | [.NET Clients](https://docs.opensearch.org/latest/clients/dot-net/) |
+| **Rust** | `opensearch-rs` | [Rust Client](https://docs.opensearch.org/latest/clients/rust/) |
+| **Hadoop** | `opensearch-hadoop` | [GitHub](https://github.com/opensearch-project/opensearch-hadoop) |
+
+For additional client details, see the [OpenSearch Clients Documentation](https://docs.opensearch.org/latest/clients/).
+
+## References \{#references\}
+
+- [OpenSearch Upgrade and Migration Guide](https://docs.opensearch.org/latest/upgrade-or-migrate/)
+- [Take and Restore Snapshots](https://docs.opensearch.org/latest/tuning-your-cluster/availability-and-recovery/snapshots/snapshot-restore/)
+- [Reindex Data](https://docs.opensearch.org/latest/im-plugin/reindex/)
+- [Configure Settings in the Keystore](https://docs.opensearch.org/latest/install-and-configure/configuring-opensearch/keystore/)
+
+---
+
+OpenSearch® is a registered trademark of LF Projects, LLC.
