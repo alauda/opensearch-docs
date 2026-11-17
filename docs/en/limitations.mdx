@@ -75,6 +75,8 @@ The OpenSearch and OpenSearch Dashboards images in E1 3.0 do not include these p
 
 Features that depend on them are not available. All other plugins of the upstream distribution are included.
 
+Plugins that are not part of the upstream distribution are not included either. In particular, `repository-s3`, which snapshots to S3-compatible object storage need, must be installed through `spec.general.pluginsList`. See [Snapshots to S3](./functions/snapshot_s3.mdx).
+
 ## Resource changes roll one pod at a time \{#rolling_restart_pace\}
 
 Changing the resources, version or configuration of a node pool makes the operator restart the pods one at a time, waiting for each pod to rejoin and the cluster to be healthy before the next one. Expect roughly 3 to 4 minutes per pod; a cluster with 9 pods takes about half an hour to finish.
